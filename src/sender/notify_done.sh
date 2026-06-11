@@ -10,5 +10,8 @@ if [ "$MIN" -gt 0 ] && [ -f "$START_FILE" ]; then
   if [ -n "$start" ] && [ $((now - start)) -lt "$MIN" ]; then exit 0; fi
 fi
 if [ -f "$ARM_FLAG" ]; then act="alarm"; else act="beep"; fi
-curl -s --max-time 2 "http://localhost:${PORT}/${act}" >/dev/null 2>&1 &
+LABEL="$(hostname -s 2>/dev/null || echo host)/$(basename "$PWD" 2>/dev/null)"
+HDR=(); [ -f "$DIR/token" ] && HDR=(-H "X-CC-Token: $(cat "$DIR/token")")
+curl -s --max-time 2 "${HDR[@]}" -G --data-urlencode "label=${LABEL}" \
+  "http://localhost:${PORT}/${act}" >/dev/null 2>&1 &
 exit 0

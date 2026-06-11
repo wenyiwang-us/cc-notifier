@@ -41,6 +41,70 @@ hdr(){ printf '\n== %s ==\n' "$*"; }
 
 write_sender(){
   mkdir -p "$DIR"
+  cat > "$DIR/cc_doctor.sh" <<'CCN_EOF_cc_doctor_sh'
+#!/bin/bash
+# Diagnose the whole cc-notifier chain. Run on either end (it adapts to the OS).
+DIR="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"
+PORT="${CC_NOTIFY_PORT:-28765}"
+OS="$(uname -s)"
+g='\033[32m'; r='\033[31m'; y='\033[33m'; z='\033[0m'
+ok(){   printf "  ${g}OK${z}  %s\n" "$*"; }
+bad(){  printf "  ${r}XX${z}  %s\n" "$*"; }
+warn(){ printf "  ${y}??${z}  %s\n" "$*"; }
+note(){ printf "  ..  %s\n" "$*"; }
+HDR=(); [ -f "$DIR/token" ] && HDR=(-H "X-CC-Token: $(cat "$DIR/token")")
+hc(){ curl -s --max-time 4 -o /dev/null -w '%{http_code}' "$@" 2>/dev/null; }
+
+printf "cc-notifier doctor — %s (%s)\n" "$(uname -n)" "$OS"
+
+# --- listener reachable (on a remote this also proves the tunnel) ---
+code="$(hc "http://localhost:${PORT}/ping")"
+if [ "$code" = 200 ]; then ok "listener reachable on localhost:${PORT}"
+else bad "listener NOT reachable (HTTP ${code:-none})"
+  if [ "$OS" = Darwin ]; then note "fix: launchctl load ~/Library/LaunchAgents/com.ccnotifier.listener.plist"
+  else note "fix (tunnel down): from your Mac  ssh -O forward -R ${PORT}:localhost:${PORT} <host>"; fi
+fi
+
+# --- auth ---
+if [ -f "$DIR/token" ]; then
+  sc="$(hc "${HDR[@]}" "http://localhost:${PORT}/stop")"
+  [ "$sc" = 200 ] && ok "auth token accepted by listener" \
+                  || warn "token present but listener returned ${sc} — tokens differ between ends? (cc_token.sh)"
+else
+  warn "auth OFF (no $DIR/token). On a shared host others can reach the port. Enable: cc_token.sh new"
+fi
+
+# --- arm + hooks ---
+[ -f "$DIR/armed" ] && note "armed (long alarm)" || note "disarmed (short chime)"
+S="$HOME/.claude/settings.json"
+if command -v python3 >/dev/null 2>&1 && [ -f "$S" ]; then
+  n="$(python3 -c "import json;d=json.load(open('$S'));print(sum('/.cc-notifier/' in h.get('command','') for e in d.get('hooks',{}).values() for grp in e for h in grp.get('hooks',[])))" 2>/dev/null)"
+  [ "${n:-0}" -ge 4 ] && ok "CC hooks wired (${n}/4 in user settings)" \
+                      || warn "CC hooks: ${n:-0}/4 in $S — run install.sh, then restart CC"
+fi
+
+# --- receiver-only checks ---
+if [ "$OS" = Darwin ]; then
+  c4="$(hc -4 "http://localhost:${PORT}/ping")"; c6="$(hc -6 "http://localhost:${PORT}/ping")"
+  { [ "$c4" = 200 ] && [ "$c6" = 200 ]; } && ok "listening on both IPv4 + IPv6 loopback" \
+                                          || warn "loopback v4=$c4 v6=$c6 — ssh may forward to the missing family"
+  if command -v alerter >/dev/null 2>&1 || [ -x /opt/homebrew/bin/alerter ] || [ -x /usr/local/bin/alerter ]
+    then ok "alerter installed"; else bad "alerter missing -> brew install vjeantet/tap/alerter"; fi
+  hk="$(python3 "$DIR/cc_hotkey.py" 2>/dev/null)"
+  [ -n "$hk" ] && ok "Karabiner stop hotkey: $hk" \
+               || warn "no Karabiner stop rule found — enable it in Karabiner › Complex Modifications"
+  launchctl list 2>/dev/null | grep -q ccnotifier && ok "launchd listener agent loaded" \
+                                                   || warn "launchd agent not loaded (launchctl load …com.ccnotifier.listener.plist)"
+  ( [ -f "$DIR/config" ] && . "$DIR/config"
+    if [ -n "${CC_TELEGRAM_TOKEN:-}" ] && [ -n "${CC_TELEGRAM_CHAT_ID:-}" ]; then
+      curl -s --max-time 6 "https://api.telegram.org/bot${CC_TELEGRAM_TOKEN}/getMe" | grep -q '"ok":true' \
+        && ok "Telegram bot reachable + token valid" || warn "Telegram configured but getMe failed (token/network)"
+    else note "Telegram push not configured (optional)"; fi )
+  note "alerter notification permission + Focus allow-list can't be checked here — verify by running: $DIR/cc_tunnel_test.sh alarm"
+else
+  note "run doctor on your Mac too for receiver checks (alerter, Karabiner, launchd, Telegram)"
+fi
+CCN_EOF_cc_doctor_sh
   cat > "$DIR/cc_notify_arm.sh" <<'CCN_EOF_cc_notify_arm_sh'
 #!/bin/bash
 # Arm/disarm the round-end notifier. Flag persists across reboots ($DIR/armed).
@@ -53,14 +117,49 @@ case "${1:-status}" in
   *) echo "usage: $0 [on|off|status]"; exit 1;;
 esac
 CCN_EOF_cc_notify_arm_sh
+  cat > "$DIR/cc_token.sh" <<'CCN_EOF_cc_token_sh'
+#!/bin/bash
+# Manage the shared auth token. The SAME value must exist on the Mac (receiver)
+# and on each remote (sender) at <dir>/token. Without it, anyone who can reach
+# the listener port — including other users on a shared login node — can trigger
+# or silence your alarms.
+#
+#   cc_token.sh new          generate a random token here, print it (copy to other machines)
+#   cc_token.sh set <value>  set a specific token (use the value printed by `new` on the Mac)
+#   cc_token.sh show         print the current token
+#   cc_token.sh off          remove the token (auth OFF)
+DIR="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"
+F="$DIR/token"
+mkdir -p "$DIR"
+case "${1:-show}" in
+  new)
+    t="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    printf '%s' "$t" > "$F"; chmod 600 "$F"
+    echo "$t"
+    echo "(saved to $F — run 'cc_token.sh set $t' on every other machine)" >&2 ;;
+  set)
+    [ -n "${2:-}" ] || { echo "usage: $0 set <value>" >&2; exit 1; }
+    printf '%s' "$2" > "$F"; chmod 600 "$F"; echo "token set ($F)" >&2 ;;
+  show)
+    [ -f "$F" ] && cat "$F" || { echo "(no token — auth OFF)" >&2; exit 1; } ;;
+  off)
+    rm -f "$F"; echo "token removed — auth OFF" >&2 ;;
+  *) echo "usage: $0 [new|set <value>|show|off]" >&2; exit 1 ;;
+esac
+CCN_EOF_cc_token_sh
   cat > "$DIR/cc_tunnel_test.sh" <<'CCN_EOF_cc_tunnel_test_sh'
 #!/bin/bash
 # Self-test the notifier path. Usage: cc_tunnel_test.sh [ping|beep|alarm|ask|stop]
 PORT="${CC_NOTIFY_PORT:-28765}"
+DIR="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"
 ACT="${1:-ping}"
-code=$(curl -s --max-time 4 -o /dev/null -w "%{http_code}" "http://localhost:${PORT}/${ACT}"); ec=$?
+HDR=(); [ -f "$DIR/token" ] && HDR=(-H "X-CC-Token: $(cat "$DIR/token")")
+code=$(curl -s --max-time 4 -o /dev/null -w "%{http_code}" "${HDR[@]}" "http://localhost:${PORT}/${ACT}"); ec=$?
 if [ "$code" = "200" ]; then echo "OK   /${ACT} -> HTTP 200"; exit 0; fi
 echo "FAIL /${ACT} -> HTTP=${code} curl_exit=${ec}"
+case "$code" in
+  403) echo "  rejected: auth token missing/mismatch. Sync $DIR/token with the Mac (cc_token.sh).";;
+esac
 case "$ec" in
   7|56) echo "  reachable on this host but not delivering. If REMOTE, from your Mac: ssh -O cancel -R ${PORT}:localhost:${PORT} <host>; ssh -O forward -R ${PORT}:localhost:${PORT} <host>";;
   28)   echo "  no forward/tunnel. If REMOTE, from your Mac: ssh -O forward -R ${PORT}:localhost:${PORT} <host>";;
@@ -72,7 +171,11 @@ CCN_EOF_cc_tunnel_test_sh
 # PreToolUse(AskUserQuestion) hook: CC is asking you a question and is BLOCKED
 # waiting. Always notify (no time guard, independent of arm state).
 PORT="${CC_NOTIFY_PORT:-28765}"
-curl -s --max-time 2 "http://localhost:${PORT}/ask" >/dev/null 2>&1 &
+DIR="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"
+LABEL="$(hostname -s 2>/dev/null || echo host)/$(basename "$PWD" 2>/dev/null)"
+HDR=(); [ -f "$DIR/token" ] && HDR=(-H "X-CC-Token: $(cat "$DIR/token")")
+curl -s --max-time 2 "${HDR[@]}" -G --data-urlencode "label=${LABEL}" \
+  "http://localhost:${PORT}/ask" >/dev/null 2>&1 &
 exit 0
 CCN_EOF_notify_ask_sh
   cat > "$DIR/notify_done.sh" <<'CCN_EOF_notify_done_sh'
@@ -88,7 +191,10 @@ if [ "$MIN" -gt 0 ] && [ -f "$START_FILE" ]; then
   if [ -n "$start" ] && [ $((now - start)) -lt "$MIN" ]; then exit 0; fi
 fi
 if [ -f "$ARM_FLAG" ]; then act="alarm"; else act="beep"; fi
-curl -s --max-time 2 "http://localhost:${PORT}/${act}" >/dev/null 2>&1 &
+LABEL="$(hostname -s 2>/dev/null || echo host)/$(basename "$PWD" 2>/dev/null)"
+HDR=(); [ -f "$DIR/token" ] && HDR=(-H "X-CC-Token: $(cat "$DIR/token")")
+curl -s --max-time 2 "${HDR[@]}" -G --data-urlencode "label=${LABEL}" \
+  "http://localhost:${PORT}/${act}" >/dev/null 2>&1 &
 exit 0
 CCN_EOF_notify_done_sh
   cat > "$DIR/notify_healthcheck.sh" <<'CCN_EOF_notify_healthcheck_sh'
@@ -108,7 +214,8 @@ CCN_EOF_notify_healthcheck_sh
 PORT="${CC_NOTIFY_PORT:-28765}"
 DIR="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"
 mkdir -p "$DIR"; date +%s > "$DIR/turn_start" 2>/dev/null
-curl -s --max-time 2 "http://localhost:${PORT}/stop" >/dev/null 2>&1 &
+HDR=(); [ -f "$DIR/token" ] && HDR=(-H "X-CC-Token: $(cat "$DIR/token")")
+curl -s --max-time 2 "${HDR[@]}" "http://localhost:${PORT}/stop" >/dev/null 2>&1 &
 exit 0
 CCN_EOF_notify_stop_sh
   chmod +x "$DIR"/*.sh "$DIR"/*.py 2>/dev/null || true
@@ -123,6 +230,9 @@ write_receiver(){
 # showing a persistent alert with one button; any click (or /stop) silences it.
 # Optional phone push via Telegram if CC_TELEGRAM_TOKEN + CC_TELEGRAM_CHAT_ID set.
 find_bin(){ for p in "$@"; do [ -n "$p" ] && [ -x "$p" ] && { printf '%s' "$p"; return 0; }; done; return 1; }
+
+# Which session/host finished (passed by the hook via ?label=...).
+[ -n "${CC_LABEL:-}" ] && MSG="$MSG — $CC_LABEL"
 
 # --- optional phone push (relayed from THIS Mac; senders like Aurora may block Telegram) ---
 if [ -n "${CC_TELEGRAM_TOKEN:-}" ] && [ -n "${CC_TELEGRAM_CHAT_ID:-}" ]; then
@@ -160,14 +270,36 @@ CCN_EOF__attention_sh
   cat > "$DIR/cc_alarm_listener.py" <<'CCN_EOF_cc_alarm_listener_py'
 #!/usr/bin/env python3
 """Local alarm listener. Binds loopback on BOTH 127.0.0.1 and ::1 (ssh forwards
-`localhost` may hit ::1 first). Endpoints: /beep /alarm /done /ask /stop /ping."""
-import http.server, os, signal, socket, socketserver, subprocess, threading
+`localhost` may hit ::1 first). Endpoints: /beep /alarm /done /ask /stop /ping.
+
+Guards:
+  - rejects requests carrying a non-local Origin header (browser CSRF / DNS-rebind);
+  - if a token file (<dir>/token) exists, action endpoints require a matching
+    X-CC-Token header (/ping stays open for liveness). The token is re-read per
+    request, so enabling/disabling auth needs no listener restart.
+A ?label=... query is sanitized and passed to the alarm as $CC_LABEL.
+"""
+import http.server, os, re, signal, socket, socketserver, subprocess, threading
+from urllib.parse import urlsplit, parse_qs
+
 PORT = int(os.environ.get("CC_NOTIFY_PORT", "28765"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 ALARM = os.path.join(HERE, "cc_alarm.sh")
 BEEP = os.path.join(HERE, "cc_beep.sh")
 ASK = os.path.join(HERE, "cc_ask.sh")
+LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+
 _lock = threading.Lock(); _current = None
+
+
+def _token():
+    try:
+        with open(os.path.join(HERE, "token")) as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
 def stop_alarm():
     global _current
     with _lock:
@@ -175,18 +307,34 @@ def stop_alarm():
             try: os.killpg(os.getpgid(_current.pid), signal.SIGTERM)
             except ProcessLookupError: pass
         _current = None
-def start_proc(script):
+
+
+def start_proc(script, label=""):
     global _current
     stop_alarm()
+    env = dict(os.environ)
+    if label: env["CC_LABEL"] = label
     with _lock:
-        _current = subprocess.Popen(["/bin/bash", script], start_new_session=True)
+        _current = subprocess.Popen(["/bin/bash", script], start_new_session=True, env=env)
+
+
 def play_beep():
     subprocess.Popen(["/bin/bash", BEEP], start_new_session=True)
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def _route(self):
-        path = self.path.split("?")[0].rstrip("/")
-        if path in ("/alarm", "/done"): start_proc(ALARM); body = b"alarm\n"
-        elif path == "/ask": start_proc(ASK); body = b"ask\n"
+        origin = self.headers.get("Origin")
+        if origin and urlsplit(origin).hostname not in LOCAL_HOSTS:
+            self.send_response(403); self.end_headers(); return
+        u = urlsplit(self.path)
+        path = u.path.rstrip("/")
+        tok = _token()
+        if path != "/ping" and tok and self.headers.get("X-CC-Token", "") != tok:
+            self.send_response(403); self.end_headers(); return
+        label = re.sub(r"[^\w\-./ ]", "", parse_qs(u.query).get("label", [""])[0])[:64]
+        if path in ("/alarm", "/done"): start_proc(ALARM, label); body = b"alarm\n"
+        elif path == "/ask": start_proc(ASK, label); body = b"ask\n"
         elif path == "/beep": play_beep(); body = b"beep\n"
         elif path == "/stop": stop_alarm(); body = b"stopped\n"
         elif path in ("/ping", ""): body = b"ok\n"
@@ -195,8 +343,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(body)
     do_GET = _route; do_POST = _route
     def log_message(self, *a): pass
+
+
 class V4(socketserver.ThreadingTCPServer): allow_reuse_address = True; daemon_threads = True
 class V6(socketserver.ThreadingTCPServer): address_family = socket.AF_INET6; allow_reuse_address = True; daemon_threads = True
+
+
 def main():
     servers = []
     for cls, host in ((V4, "127.0.0.1"), (V6, "::1")):
@@ -206,6 +358,8 @@ def main():
     ts = [threading.Thread(target=s.serve_forever, daemon=True) for s in servers]
     for t in ts: t.start()
     for t in ts: t.join()
+
+
 if __name__ == "__main__": main()
 CCN_EOF_cc_alarm_listener_py
   cat > "$DIR/cc_alarm.sh" <<'CCN_EOF_cc_alarm_sh'
@@ -347,9 +501,11 @@ for f in "${FILES[@]}"; do [ -f "$f" ] || continue; printf '> %s\n' "$(basename 
 CCN_EOF_cc_preview_sounds_sh
   cat > "$DIR/cc_stop.sh" <<'CCN_EOF_cc_stop_sh'
 #!/bin/bash
-# Instant local stop — bind to a hotkey (Shortcuts: Run Shell Script).
+# Instant local stop — bind to a hotkey (Karabiner / Shortcuts: Run Shell Script).
 PORT="${CC_NOTIFY_PORT:-28765}"
-curl -s --max-time 2 "http://localhost:${PORT}/stop" >/dev/null 2>&1
+DIR="$(cd "$(dirname "$0")" && pwd)"
+HDR=(); [ -f "$DIR/token" ] && HDR=(-H "X-CC-Token: $(cat "$DIR/token")")
+curl -s --max-time 2 "${HDR[@]}" "http://localhost:${PORT}/stop" >/dev/null 2>&1
 CCN_EOF_cc_stop_sh
   cat > "$DIR/karabiner-stop.json" <<'CCN_EOF_karabiner_stop_json'
 {
@@ -524,6 +680,8 @@ if [ "$ROLE" = receiver ]; then
        RemoteForward $PORT localhost:$PORT
   Test now:  $DIR/cc_tunnel_test.sh beep   (and: $DIR/cc_tunnel_test.sh ask)
   Arm/disarm any session:  $DIR/cc_notify_arm.sh on | off | status
+  Diagnose anytime:  $DIR/cc_doctor.sh
+  Secure it (recommended for shared remotes):  $DIR/cc_token.sh new   (copy the value to each remote)
 EOF_NEXT
 else
   write_sender
@@ -538,8 +696,9 @@ else
          RemoteForward $PORT localhost:$PORT
     2. Reconnect (or: ssh -O forward -R $PORT:localhost:$PORT <host>)
     3. Make sure the Mac receiver is installed (run this script on the Mac).
-  Verify from here:  $DIR/cc_tunnel_test.sh
+  Verify from here:  $DIR/cc_tunnel_test.sh   (or full check: $DIR/cc_doctor.sh)
   Arm/disarm any session:  $DIR/cc_notify_arm.sh on | off | status
+  If your Mac set an auth token:  $DIR/cc_token.sh set <value-from-the-Mac>
 EOF_NEXT
 fi
 hdr "done"

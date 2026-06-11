@@ -189,6 +189,8 @@ if [ "$ROLE" = receiver ]; then
        RemoteForward $PORT localhost:$PORT
   Test now:  $DIR/cc_tunnel_test.sh beep   (and: $DIR/cc_tunnel_test.sh ask)
   Arm/disarm any session:  $DIR/cc_notify_arm.sh on | off | status
+  Diagnose anytime:  $DIR/cc_doctor.sh
+  Secure it (recommended for shared remotes):  $DIR/cc_token.sh new   (copy the value to each remote)
 EOF_NEXT
 else
   write_sender
@@ -203,8 +205,9 @@ else
          RemoteForward $PORT localhost:$PORT
     2. Reconnect (or: ssh -O forward -R $PORT:localhost:$PORT <host>)
     3. Make sure the Mac receiver is installed (run this script on the Mac).
-  Verify from here:  $DIR/cc_tunnel_test.sh
+  Verify from here:  $DIR/cc_tunnel_test.sh   (or full check: $DIR/cc_doctor.sh)
   Arm/disarm any session:  $DIR/cc_notify_arm.sh on | off | status
+  If your Mac set an auth token:  $DIR/cc_token.sh set <value-from-the-Mac>
 EOF_NEXT
 fi
 hdr "done"

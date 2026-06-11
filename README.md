@@ -8,7 +8,7 @@ No polling, no daemons you babysit: it rides Claude Code's hooks and a tiny laun
 
 - **Round complete** → a short chime (or, when *armed*, a 15s×3 alarm with a Stop button for when you've walked away).
 - **Claude needs your input** (the `AskUserQuestion` multiple-choice prompt) → a distinct sound + a persistent alert.
-- **Arm/disarm per session**, a global **stop hotkey**, and a **health check** that warns you at session start if the tunnel is down.
+- **Arm/disarm per session**, a global **stop hotkey**, **labeled** notifications (which host/project finished), and a **health check** that warns you at session start if the tunnel is down.
 
 ## How it works
 
@@ -79,9 +79,11 @@ Reconnect (or `ssh -O forward -R 28765:localhost:28765 <host>`), and make sure t
 ~/.cc-notifier/cc_tunnel_test.sh beep   # fire each notification type to test
 ~/.cc-notifier/cc_tunnel_test.sh alarm
 ~/.cc-notifier/cc_tunnel_test.sh ask
+
+~/.cc-notifier/cc_doctor.sh             # full health check: listener, tunnel, auth, perms, hotkey, Telegram
 ```
 
-The arm flag lives at `~/.cc-notifier/armed` and persists across reboots.
+The arm flag lives at `~/.cc-notifier/armed` and persists across reboots. Notifications are labeled with `host/project` (from the machine running Claude Code) so you can tell sessions apart.
 
 ## Hooks installed (user-level `~/.claude/settings.json`)
 
@@ -134,6 +136,8 @@ Get a Telegram message on your phone alongside the Mac alarm — free, and it us
 
 ## Troubleshooting
 
+**First run `~/.cc-notifier/cc_doctor.sh`** — it checks every link (listener, tunnel, auth, IPv4/IPv6, alerter, Karabiner, Telegram) and prints the specific fix. Common cases:
+
 - **No beep, `cc_tunnel_test.sh ping` fails with exit 56** — the reverse tunnel is stale. From your Mac: `ssh -O cancel -R 28765:localhost:28765 <host>; ssh -O forward -R 28765:localhost:28765 <host>`.
 - **Sound plays but no visual alert** — grant `alerter` notification permission (Alerts style) and allow it in your Focus modes.
 - **Stop hotkey only works when a window is focused** — the combo is already taken (e.g. ⌃⌥Space = input-source switch). Pick a free one; `~/.cc-notifier/cc_check_hotkeys.py <key>` lists system shortcuts.
@@ -143,6 +147,19 @@ Get a Telegram message on your phone alongside the Mac alarm — free, and it us
 ```bash
 bash install.sh --uninstall     # removes hooks + launchd; leaves ~/.cc-notifier (rm -rf to finish)
 ```
+
+## Security
+
+The listener is loopback-only and never runs as root, but two things are worth knowing:
+
+- **Shared remote hosts.** An ssh `RemoteForward` binds the port on the *remote's* loopback, which on a multi-user login node is reachable by **every user on that host** — so another user could trigger or silence your alarms. Enable a shared token to stop that:
+  ```bash
+  ~/.cc-notifier/cc_token.sh new            # on your Mac — prints a value
+  ~/.cc-notifier/cc_token.sh set <value>    # on each remote — same value
+  ```
+  With a token set, the action endpoints require a matching `X-CC-Token` header (`/ping` stays open). The listener re-reads the token per request, so enabling/disabling it needs no restart.
+- **Browser requests.** The listener rejects any request carrying a non-local `Origin` header, blocking CSRF / DNS-rebinding from web pages.
+- **Telegram token** lives in `~/.cc-notifier/config` (it's `chmod 600`) and rides the Telegram API URL — fine on a single-user Mac.
 
 ## Development
 

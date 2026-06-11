@@ -6,6 +6,9 @@
 # Optional phone push via Telegram if CC_TELEGRAM_TOKEN + CC_TELEGRAM_CHAT_ID set.
 find_bin(){ for p in "$@"; do [ -n "$p" ] && [ -x "$p" ] && { printf '%s' "$p"; return 0; }; done; return 1; }
 
+# Which session/host finished (passed by the hook via ?label=...).
+[ -n "${CC_LABEL:-}" ] && MSG="$MSG — $CC_LABEL"
+
 # --- optional phone push (relayed from THIS Mac; senders like Aurora may block Telegram) ---
 if [ -n "${CC_TELEGRAM_TOKEN:-}" ] && [ -n "${CC_TELEGRAM_CHAT_ID:-}" ]; then
   curl -s --max-time 5 "https://api.telegram.org/bot${CC_TELEGRAM_TOKEN}/sendMessage" \
