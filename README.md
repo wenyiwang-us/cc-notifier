@@ -109,7 +109,7 @@ CC_ASK_INTERVAL=1
 CC_BEEP_SOUND=/System/Library/Sounds/Glass.aiff    # disarmed chime (single play)
 ```
 
-Preview options with `~/.cc-notifier/cc_preview_sounds.sh loop`.
+Preview options with `~/.cc-notifier/cc_preview_sounds.sh loop`. The alert banner also shows a static `(auto-off in Ns · N×Sound)` hint so you can see how it's configured at a glance.
 
 Sender-side env vars (on the machine running Claude Code):
 
@@ -117,6 +117,20 @@ Sender-side env vars (on the machine running Claude Code):
 |---|---|---|
 | `CC_NOTIFY_PORT` | `28765` | listener port (use `install.sh --port N` to set everywhere) |
 | `CC_NOTIFY_MIN_SECONDS` | `20` | skip round-end notify for shorter turns (`0` = always) |
+
+## Phone push (Telegram, optional)
+
+Get a Telegram message on your phone alongside the Mac alarm — free, and it uses the Telegram app you already have. It's **relayed from your Mac**, so the machine running Claude Code never talks to Telegram (which matters on networks that block it — e.g. some HPC sites sinkhole it). It fires for the long alarms (`done` armed, `ask`), and only while your Mac is on.
+
+1. In Telegram, message **@BotFather** → `/newbot` → follow the prompts → copy the **bot token**.
+2. Send your new bot any message (opens a chat it can reply in).
+3. From your **Mac** (a network that can reach Telegram), open `https://api.telegram.org/bot<TOKEN>/getUpdates` and copy the `"chat":{"id": … }` number.
+4. Add both to `~/.cc-notifier/config` on the Mac:
+   ```sh
+   CC_TELEGRAM_TOKEN=123456789:ABCdef...
+   CC_TELEGRAM_CHAT_ID=123456789
+   ```
+5. Test: `~/.cc-notifier/cc_tunnel_test.sh alarm` → expect a Telegram push.
 
 ## Troubleshooting
 

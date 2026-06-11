@@ -56,6 +56,9 @@ write_config(){
 #CC_ASK_INTERVAL=1
 # Short chime (single play; sound only, no repeats):
 #CC_BEEP_SOUND=/System/Library/Sounds/Glass.aiff
+# Optional phone push via Telegram (relayed from THIS Mac). See README for setup.
+#CC_TELEGRAM_TOKEN=123456789:ABCdef_your_bot_token
+#CC_TELEGRAM_CHAT_ID=123456789
 CFG_EOF
   log "wrote config template: $cfg"
 }
