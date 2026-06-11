@@ -1,0 +1,10 @@
+# runtime / local
+*.log
+__pycache__/
+*.pyc
+.DS_Store
+
+# the deployed kit + state never belong in the repo
+.cc-notifier/
+armed
+turn_start
