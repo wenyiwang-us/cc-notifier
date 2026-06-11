@@ -21,8 +21,12 @@ fi
 _BEEP=$!
 _stop(){ kill "$_BEEP" 2>/dev/null; pkill -P "$_BEEP" afplay 2>/dev/null; }
 
-# Static hint so you know how long the alert sits + how it's configured to play.
-BANNER="$MSG  (auto-off in ${TIMEOUT:-60}s · ${REPEATS}x$(basename "${SOUND%.*}"))"
+# Static hint: the stop hotkey (read from Karabiner) + how it's configured to play.
+PYBIN="$(command -v python3 || echo /usr/bin/python3)"
+HOTKEY="$("$PYBIN" "$HERE/cc_hotkey.py" 2>/dev/null)"
+INFO="auto-off ${TIMEOUT:-60}s · ${REPEATS}x$(basename "${SOUND%.*}")"
+[ -n "$HOTKEY" ] && INFO="${HOTKEY} to stop · ${INFO}"
+BANNER="$MSG  (${INFO})"
 
 ALERTER="$(find_bin "$(command -v alerter 2>/dev/null)" /opt/homebrew/bin/alerter /usr/local/bin/alerter)"
 TN="$(find_bin "$(command -v terminal-notifier 2>/dev/null)" /opt/homebrew/bin/terminal-notifier /usr/local/bin/terminal-notifier)"
