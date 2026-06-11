@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# cc-notifier — self-contained installer for the Claude Code round-end notifier.
-# Copy this ONE file to any machine (or tell that machine's CC to run it).
+# cc-notifier — self-contained installer. GENERATED from src/ by build.sh.
+# Do not edit by hand; edit src/ and run ./build.sh.
 #
 #   bash install.sh            # auto-detect role from the OS
 #   bash install.sh receiver   # force the Mac receiver role
@@ -8,15 +8,10 @@
 #   bash install.sh --port 28765
 #   bash install.sh --uninstall
 #
-# Roles (auto-detected):
-#   receiver (macOS): the notification target — listener (launchd) + alerter +
-#                     sounds + stop kit. Also installs sender hooks for local CC.
-#   sender   (Linux): a machine where CC runs — installs hooks into
-#                     ~/.claude/settings.json so each session can arm + notify.
-#                     Remote senders reach the Mac via an ssh RemoteForward.
-#
-# Notifies on: round complete (Stop) and "CC needs your input" (AskUserQuestion).
-# Re-runnable: merges into settings.json without clobbering; safe to run twice.
+# receiver (macOS): listener (launchd) + alerter + sounds + stop kit + local hooks.
+# sender   (Linux): hooks into ~/.claude/settings.json; remote senders reach the
+#                   Mac via an ssh RemoteForward. Notifies on round-complete (Stop)
+#                   and on questions (AskUserQuestion).
 set -euo pipefail
 
 PORT=28765
@@ -31,7 +26,7 @@ while [ $# -gt 0 ]; do
     receiver|sender) ROLE="$1"; shift;;
     --port) PORT="$2"; shift 2;;
     --uninstall) UNINSTALL=1; shift;;
-    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    -h|--help) awk 'NR>1 && /^#/{sub(/^# ?/,"");print;next} NR>1{exit}' "$0"; exit 0;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
@@ -44,11 +39,43 @@ esac
 log(){ printf '  %s\n' "$*"; }
 hdr(){ printf '\n== %s ==\n' "$*"; }
 
-# ------------------------------------------------------------------ sender kit
 write_sender(){
   mkdir -p "$DIR"
-
-  cat > "$DIR/notify_done.sh" <<'EOF_DONE'
+  cat > "$DIR/cc_notify_arm.sh" <<'CCN_EOF_cc_notify_arm_sh'
+#!/bin/bash
+# Arm/disarm the round-end notifier. Flag persists across reboots ($DIR/armed).
+DIR="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"
+FLAG="${CC_NOTIFY_ARM_FLAG:-$DIR/armed}"
+case "${1:-status}" in
+  on|arm)     mkdir -p "$DIR"; : > "$FLAG"; echo "ARMED — long alarm at round end";;
+  off|disarm) rm -f "$FLAG"; echo "DISARMED — short chime at round end";;
+  status)     [ -f "$FLAG" ] && echo "ARMED (long alarm)" || echo "DISARMED (short chime)";;
+  *) echo "usage: $0 [on|off|status]"; exit 1;;
+esac
+CCN_EOF_cc_notify_arm_sh
+  cat > "$DIR/cc_tunnel_test.sh" <<'CCN_EOF_cc_tunnel_test_sh'
+#!/bin/bash
+# Self-test the notifier path. Usage: cc_tunnel_test.sh [ping|beep|alarm|ask|stop]
+PORT="${CC_NOTIFY_PORT:-28765}"
+ACT="${1:-ping}"
+code=$(curl -s --max-time 4 -o /dev/null -w "%{http_code}" "http://localhost:${PORT}/${ACT}"); ec=$?
+if [ "$code" = "200" ]; then echo "OK   /${ACT} -> HTTP 200"; exit 0; fi
+echo "FAIL /${ACT} -> HTTP=${code} curl_exit=${ec}"
+case "$ec" in
+  7|56) echo "  reachable on this host but not delivering. If REMOTE, from your Mac: ssh -O cancel -R ${PORT}:localhost:${PORT} <host>; ssh -O forward -R ${PORT}:localhost:${PORT} <host>";;
+  28)   echo "  no forward/tunnel. If REMOTE, from your Mac: ssh -O forward -R ${PORT}:localhost:${PORT} <host>";;
+esac
+exit 1
+CCN_EOF_cc_tunnel_test_sh
+  cat > "$DIR/notify_ask.sh" <<'CCN_EOF_notify_ask_sh'
+#!/bin/bash
+# PreToolUse(AskUserQuestion) hook: CC is asking you a question and is BLOCKED
+# waiting. Always notify (no time guard, independent of arm state).
+PORT="${CC_NOTIFY_PORT:-28765}"
+curl -s --max-time 2 "http://localhost:${PORT}/ask" >/dev/null 2>&1 &
+exit 0
+CCN_EOF_notify_ask_sh
+  cat > "$DIR/notify_done.sh" <<'CCN_EOF_notify_done_sh'
 #!/bin/bash
 # Stop hook: notify the Mac when a round finishes. Fire-and-forget.
 PORT="${CC_NOTIFY_PORT:-28765}"
@@ -63,28 +90,8 @@ fi
 if [ -f "$ARM_FLAG" ]; then act="alarm"; else act="beep"; fi
 curl -s --max-time 2 "http://localhost:${PORT}/${act}" >/dev/null 2>&1 &
 exit 0
-EOF_DONE
-
-  cat > "$DIR/notify_ask.sh" <<'EOF_ASK'
-#!/bin/bash
-# PreToolUse(AskUserQuestion) hook: CC is asking you a question and is BLOCKED
-# waiting. Always notify (no time guard, independent of arm state).
-PORT="${CC_NOTIFY_PORT:-28765}"
-curl -s --max-time 2 "http://localhost:${PORT}/ask" >/dev/null 2>&1 &
-exit 0
-EOF_ASK
-
-  cat > "$DIR/notify_stop.sh" <<'EOF_STOP'
-#!/bin/bash
-# UserPromptSubmit hook: record turn start + cancel any active alarm.
-PORT="${CC_NOTIFY_PORT:-28765}"
-DIR="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"
-mkdir -p "$DIR"; date +%s > "$DIR/turn_start" 2>/dev/null
-curl -s --max-time 2 "http://localhost:${PORT}/stop" >/dev/null 2>&1 &
-exit 0
-EOF_STOP
-
-  cat > "$DIR/notify_healthcheck.sh" <<'EOF_HC'
+CCN_EOF_notify_done_sh
+  cat > "$DIR/notify_healthcheck.sh" <<'CCN_EOF_notify_healthcheck_sh'
 #!/bin/bash
 # SessionStart hook: warn (into CC context) only if the notifier is unreachable.
 PORT="${CC_NOTIFY_PORT:-28765}"
@@ -94,44 +101,47 @@ if [ "$code" != "200" ]; then
   echo "NOTE: CC round-end notifier is unreachable (localhost:${PORT} -> '${code:-no-response}'). If this is a REMOTE machine, restore the tunnel from your Mac: ssh -O cancel -R ${PORT}:localhost:${PORT} <host> 2>/dev/null; ssh -O forward -R ${PORT}:localhost:${PORT} <host>. Verify: $DIR/cc_tunnel_test.sh"
 fi
 exit 0
-EOF_HC
-
-  cat > "$DIR/cc_notify_arm.sh" <<'EOF_ARM'
+CCN_EOF_notify_healthcheck_sh
+  cat > "$DIR/notify_stop.sh" <<'CCN_EOF_notify_stop_sh'
 #!/bin/bash
-# Arm/disarm the round-end notifier. Flag persists across reboots ($DIR/armed).
-DIR="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"
-FLAG="${CC_NOTIFY_ARM_FLAG:-$DIR/armed}"
-case "${1:-status}" in
-  on|arm)     mkdir -p "$DIR"; : > "$FLAG"; echo "ARMED — long alarm at round end";;
-  off|disarm) rm -f "$FLAG"; echo "DISARMED — short chime at round end";;
-  status)     [ -f "$FLAG" ] && echo "ARMED (long alarm)" || echo "DISARMED (short chime)";;
-  *) echo "usage: $0 [on|off|status]"; exit 1;;
-esac
-EOF_ARM
-
-  cat > "$DIR/cc_tunnel_test.sh" <<'EOF_TT'
-#!/bin/bash
-# Self-test the notifier path. Usage: cc_tunnel_test.sh [ping|beep|alarm|ask|stop]
+# UserPromptSubmit hook: record turn start + cancel any active alarm.
 PORT="${CC_NOTIFY_PORT:-28765}"
-ACT="${1:-ping}"
-code=$(curl -s --max-time 4 -o /dev/null -w "%{http_code}" "http://localhost:${PORT}/${ACT}"); ec=$?
-if [ "$code" = "200" ]; then echo "OK   /${ACT} -> HTTP 200"; exit 0; fi
-echo "FAIL /${ACT} -> HTTP=${code} curl_exit=${ec}"
-case "$ec" in
-  7|56) echo "  reachable on this host but not delivering. If REMOTE, from your Mac: ssh -O cancel -R ${PORT}:localhost:${PORT} <host>; ssh -O forward -R ${PORT}:localhost:${PORT} <host>";;
-  28)   echo "  no forward/tunnel. If REMOTE, from your Mac: ssh -O forward -R ${PORT}:localhost:${PORT} <host>";;
-esac
-exit 1
-EOF_TT
-
-  chmod +x "$DIR"/*.sh
+DIR="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"
+mkdir -p "$DIR"; date +%s > "$DIR/turn_start" 2>/dev/null
+curl -s --max-time 2 "http://localhost:${PORT}/stop" >/dev/null 2>&1 &
+exit 0
+CCN_EOF_notify_stop_sh
+  chmod +x "$DIR"/*.sh "$DIR"/*.py 2>/dev/null || true
 }
-
-# ---------------------------------------------------------------- receiver kit
 write_receiver(){
   mkdir -p "$DIR"
+  cat > "$DIR/_attention.sh" <<'CCN_EOF__attention_sh'
+#!/bin/bash
+# Shared engine for the long attention alarms (cc_alarm.sh / cc_ask.sh).
+# The caller sources this AFTER setting: SOUND, REPEATS, INTERVAL, TITLE, MSG,
+# BUTTON, TIMEOUT. Plays SOUND, REPEATS times, INTERVAL seconds apart, while
+# showing a persistent alert with one button; any click (or /stop) silences it.
+find_bin(){ for p in "$@"; do [ -n "$p" ] && [ -x "$p" ] && { printf '%s' "$p"; return 0; }; done; return 1; }
 
-  cat > "$DIR/cc_alarm_listener.py" <<'EOF_LISTENER'
+( for ((i = 1; i <= REPEATS; i++)); do
+    afplay "$SOUND"
+    [ "$i" -lt "$REPEATS" ] && sleep "$INTERVAL"
+  done ) &
+_BEEP=$!
+_stop(){ kill "$_BEEP" 2>/dev/null; pkill -P "$_BEEP" afplay 2>/dev/null; }
+
+ALERTER="$(find_bin "$(command -v alerter 2>/dev/null)" /opt/homebrew/bin/alerter /usr/local/bin/alerter)"
+TN="$(find_bin "$(command -v terminal-notifier 2>/dev/null)" /opt/homebrew/bin/terminal-notifier /usr/local/bin/terminal-notifier)"
+if [ -n "$ALERTER" ]; then
+  "$ALERTER" --title "$TITLE" --message "$MSG" --actions "${BUTTON:-Stop}" --timeout "${TIMEOUT:-60}" >/dev/null 2>&1
+  _stop
+elif [ -n "$TN" ]; then
+  "$TN" -title "$TITLE" -message "$MSG" -group cc-notifier >/dev/null 2>&1; wait "$_BEEP" 2>/dev/null
+else
+  osascript -e "display notification \"$MSG\" with title \"$TITLE\"" >/dev/null 2>&1; wait "$_BEEP" 2>/dev/null
+fi
+CCN_EOF__attention_sh
+  cat > "$DIR/cc_alarm_listener.py" <<'CCN_EOF_cc_alarm_listener_py'
 #!/usr/bin/env python3
 """Local alarm listener. Binds loopback on BOTH 127.0.0.1 and ::1 (ssh forwards
 `localhost` may hit ::1 first). Endpoints: /beep /alarm /done /ask /stop /ping."""
@@ -181,86 +191,47 @@ def main():
     for t in ts: t.start()
     for t in ts: t.join()
 if __name__ == "__main__": main()
-EOF_LISTENER
-
-  cat > "$DIR/cc_alarm.sh" <<'EOF_ALARM'
+CCN_EOF_cc_alarm_listener_py
+  cat > "$DIR/cc_alarm.sh" <<'CCN_EOF_cc_alarm_sh'
 #!/bin/bash
-# Long alarm: notification with a Stop button + beep 15s x N. Knobs:
-#   CC_ALARM_SOUND (default Blow / "Breeze"), CC_ALARM_CYCLES (3), CC_ALARM_TITLE/MSG
+# Round-complete alarm (armed mode). Configurable via ~/.cc-notifier/config:
+#   CC_ALARM_SOUND     default Blow ("Breeze")
+#   CC_ALARM_REPEATS   how many times the sound plays (default 10)
+#   CC_ALARM_INTERVAL  seconds between plays (default 1)
+HERE="$(cd "$(dirname "$0")" && pwd)"; [ -f "$HERE/config" ] && . "$HERE/config"
 SOUND="${CC_ALARM_SOUND:-/System/Library/Sounds/Blow.aiff}"
-CYCLES="${CC_ALARM_CYCLES:-3}"
+REPEATS="${CC_ALARM_REPEATS:-10}"
+INTERVAL="${CC_ALARM_INTERVAL:-1}"
 TITLE="${CC_ALARM_TITLE:-Claude Code}"
 MSG="${CC_ALARM_MSG:-Round complete — press Stop to silence}"
-( for ((c=1;c<=CYCLES;c++)); do
-    end=$((SECONDS+15)); while [ "$SECONDS" -lt "$end" ]; do afplay "$SOUND"; done
-    [ "$c" -lt "$CYCLES" ] && sleep 2
-  done ) &
-BEEP=$!
-stop_beeps(){ kill "$BEEP" 2>/dev/null; pkill -P "$BEEP" afplay 2>/dev/null; }
-find_bin(){ for p in "$@"; do [ -n "$p" ] && [ -x "$p" ] && { printf '%s' "$p"; return 0; }; done; return 1; }
-ALERTER="$(find_bin "$(command -v alerter 2>/dev/null)" /opt/homebrew/bin/alerter /usr/local/bin/alerter)"
-TN="$(find_bin "$(command -v terminal-notifier 2>/dev/null)" /opt/homebrew/bin/terminal-notifier /usr/local/bin/terminal-notifier)"
-if [ -n "$ALERTER" ]; then
-  action="$("$ALERTER" --title "$TITLE" --message "$MSG" --actions "Stop" --timeout 60 2>/dev/null)"
-  case "$action" in "" | @TIMEOUT*) wait "$BEEP" 2>/dev/null ;; *) stop_beeps ;; esac
-elif [ -n "$TN" ]; then
-  "$TN" -title "$TITLE" -message "$MSG" -group cc-alarm >/dev/null 2>&1; wait "$BEEP" 2>/dev/null
-else
-  osascript -e "display notification \"$MSG\" with title \"$TITLE\"" >/dev/null 2>&1; wait "$BEEP" 2>/dev/null
-fi
-EOF_ALARM
-
-  cat > "$DIR/cc_ask.sh" <<'EOF_CCASK'
+BUTTON="Stop"
+TIMEOUT="${CC_ALARM_TIMEOUT:-60}"
+. "$HERE/_attention.sh"
+CCN_EOF_cc_alarm_sh
+  cat > "$DIR/cc_ask.sh" <<'CCN_EOF_cc_ask_sh'
 #!/bin/bash
-# "CC needs your input" — distinct short attention sound + persistent alert.
-# Shorter than the round-end alarm; the alert stays until you click OK / hotkey.
-# Knobs: CC_ASK_SOUND (default Funk), CC_ASK_CYCLES (3), CC_ASK_TITLE/MSG
+# "CC needs your input" alarm (AskUserQuestion). Configurable via ~/.cc-notifier/config:
+#   CC_ASK_SOUND     default Funk
+#   CC_ASK_REPEATS   how many times the sound plays (default 3)
+#   CC_ASK_INTERVAL  seconds between plays (default 1)
+HERE="$(cd "$(dirname "$0")" && pwd)"; [ -f "$HERE/config" ] && . "$HERE/config"
 SOUND="${CC_ASK_SOUND:-/System/Library/Sounds/Funk.aiff}"
-CYCLES="${CC_ASK_CYCLES:-3}"
+REPEATS="${CC_ASK_REPEATS:-3}"
+INTERVAL="${CC_ASK_INTERVAL:-1}"
 TITLE="${CC_ASK_TITLE:-Claude Code}"
 MSG="${CC_ASK_MSG:-Needs your input — answer the question in VSCode}"
-( for ((i=1;i<=CYCLES;i++)); do afplay "$SOUND"; sleep 1; done ) &
-BEEP=$!
-stop_beeps(){ kill "$BEEP" 2>/dev/null; pkill -P "$BEEP" afplay 2>/dev/null; }
-find_bin(){ for p in "$@"; do [ -n "$p" ] && [ -x "$p" ] && { printf '%s' "$p"; return 0; }; done; return 1; }
-ALERTER="$(find_bin "$(command -v alerter 2>/dev/null)" /opt/homebrew/bin/alerter /usr/local/bin/alerter)"
-TN="$(find_bin "$(command -v terminal-notifier 2>/dev/null)" /opt/homebrew/bin/terminal-notifier /usr/local/bin/terminal-notifier)"
-if [ -n "$ALERTER" ]; then
-  "$ALERTER" --title "$TITLE" --message "$MSG" --actions "OK" --timeout 120 >/dev/null 2>&1
-  stop_beeps
-elif [ -n "$TN" ]; then
-  "$TN" -title "$TITLE" -message "$MSG" -group cc-ask >/dev/null 2>&1; wait "$BEEP" 2>/dev/null
-else
-  osascript -e "display notification \"$MSG\" with title \"$TITLE\"" >/dev/null 2>&1; wait "$BEEP" 2>/dev/null
-fi
-EOF_CCASK
-
-  cat > "$DIR/cc_beep.sh" <<'EOF_BEEP'
+BUTTON="OK"
+TIMEOUT="${CC_ASK_TIMEOUT:-120}"
+. "$HERE/_attention.sh"
+CCN_EOF_cc_ask_sh
+  cat > "$DIR/cc_beep.sh" <<'CCN_EOF_cc_beep_sh'
 #!/bin/bash
-# Short chime — single play. Knob: CC_BEEP_SOUND (default Glass).
+# Short chime — ALWAYS a single play (sound is configurable, repeats are not).
+HERE="$(cd "$(dirname "$0")" && pwd)"; [ -f "$HERE/config" ] && . "$HERE/config"
 SOUND="${CC_BEEP_SOUND:-/System/Library/Sounds/Glass.aiff}"
 afplay "$SOUND"
-EOF_BEEP
-
-  cat > "$DIR/cc_stop.sh" <<'EOF_CCSTOP'
-#!/bin/bash
-# Instant local stop — bind to a hotkey (Shortcuts: Run Shell Script).
-PORT="${CC_NOTIFY_PORT:-28765}"
-curl -s --max-time 2 "http://localhost:${PORT}/stop" >/dev/null 2>&1
-EOF_CCSTOP
-
-  cat > "$DIR/cc_preview_sounds.sh" <<'EOF_PREVIEW'
-#!/bin/bash
-# Preview macOS sounds. cc_preview_sounds.sh [once|loop] [Name...]
-MODE="once"; case "$1" in once|loop) MODE="$1"; shift;; esac
-if [ "$#" -gt 0 ]; then FILES=(); for n in "$@"; do FILES+=("/System/Library/Sounds/${n}.aiff"); done
-else FILES=(/System/Library/Sounds/*.aiff ~/Library/Sounds/*.aiff); fi
-for f in "${FILES[@]}"; do [ -f "$f" ] || continue; printf '> %s\n' "$(basename "$f" .aiff)"
-  if [ "$MODE" = loop ]; then e=$((SECONDS+5)); while [ "$SECONDS" -lt "$e" ]; do afplay "$f"; done; else afplay "$f"; fi
-  sleep 0.4; done
-EOF_PREVIEW
-
-  cat > "$DIR/cc_check_hotkeys.py" <<'EOF_HOTKEYS'
+CCN_EOF_cc_beep_sh
+  cat > "$DIR/cc_check_hotkeys.py" <<'CCN_EOF_cc_check_hotkeys_py'
 #!/usr/bin/env python3
 """List enabled macOS *system* keyboard shortcuts (does NOT cover app/3rd-party).
 Usage: cc_check_hotkeys.py [filter]"""
@@ -285,17 +256,49 @@ def main():
         if not needle or needle in r.lower(): print(r)
     print("\nApp-menu & third-party global hotkeys are NOT listed — also check System Settings > Keyboard > Keyboard Shortcuts.")
 if __name__=="__main__": main()
-EOF_HOTKEYS
-
-  chmod +x "$DIR"/*.sh "$DIR"/*.py
+CCN_EOF_cc_check_hotkeys_py
+  cat > "$DIR/cc_preview_sounds.sh" <<'CCN_EOF_cc_preview_sounds_sh'
+#!/bin/bash
+# Preview macOS sounds. cc_preview_sounds.sh [once|loop] [Name...]
+MODE="once"; case "$1" in once|loop) MODE="$1"; shift;; esac
+if [ "$#" -gt 0 ]; then FILES=(); for n in "$@"; do FILES+=("/System/Library/Sounds/${n}.aiff"); done
+else FILES=(/System/Library/Sounds/*.aiff ~/Library/Sounds/*.aiff); fi
+for f in "${FILES[@]}"; do [ -f "$f" ] || continue; printf '> %s\n' "$(basename "$f" .aiff)"
+  if [ "$MODE" = loop ]; then e=$((SECONDS+5)); while [ "$SECONDS" -lt "$e" ]; do afplay "$f"; done; else afplay "$f"; fi
+  sleep 0.4; done
+CCN_EOF_cc_preview_sounds_sh
+  cat > "$DIR/cc_stop.sh" <<'CCN_EOF_cc_stop_sh'
+#!/bin/bash
+# Instant local stop — bind to a hotkey (Shortcuts: Run Shell Script).
+PORT="${CC_NOTIFY_PORT:-28765}"
+curl -s --max-time 2 "http://localhost:${PORT}/stop" >/dev/null 2>&1
+CCN_EOF_cc_stop_sh
+  chmod +x "$DIR"/*.sh "$DIR"/*.py 2>/dev/null || true
 }
 
-# ------------------------------------------------------- merge CC hooks (idempotent)
+write_config(){
+  local cfg="$DIR/config"
+  [ -f "$cfg" ] && return 0
+  cat > "$cfg" <<'CFG_EOF'
+# cc-notifier config — uncomment & edit. Read on each alarm (no reload needed).
+# Long round-end alarm (armed mode):
+#CC_ALARM_SOUND=/System/Library/Sounds/Blow.aiff
+#CC_ALARM_REPEATS=10
+#CC_ALARM_INTERVAL=1
+# "Needs your input" alarm (AskUserQuestion):
+#CC_ASK_SOUND=/System/Library/Sounds/Funk.aiff
+#CC_ASK_REPEATS=3
+#CC_ASK_INTERVAL=1
+# Short chime (single play; sound only, no repeats):
+#CC_BEEP_SOUND=/System/Library/Sounds/Glass.aiff
+CFG_EOF
+  log "wrote config template: $cfg"
+}
+
 merge_hooks(){
   python3 - "$SETTINGS" "$DIR" <<'PYMERGE'
 import json, os, sys
 settings_path, d = sys.argv[1], sys.argv[2]
-# event -> (script, timeout, matcher-or-None)
 events = {
     "SessionStart":     ("notify_healthcheck.sh", 10, None),
     "UserPromptSubmit": ("notify_stop.sh", 5, None),
@@ -324,7 +327,6 @@ print("  hooks merged into", settings_path)
 PYMERGE
 }
 
-# ----------------------------------------------------------- launchd (macOS only)
 install_launchd(){
   local plist="$HOME/Library/LaunchAgents/com.ccnotifier.listener.plist"
   mkdir -p "$HOME/Library/LaunchAgents"
@@ -352,7 +354,6 @@ apply_port(){
   find "$DIR" -name '*.bak' -delete
 }
 
-# ----------------------------------------------------------------------- uninstall
 do_uninstall(){
   hdr "uninstall"
   if [ "$OS" = Darwin ]; then
@@ -378,13 +379,13 @@ PYUNMERGE
   exit 0
 }
 
-# ============================================================================ run
 [ "$UNINSTALL" = 1 ] && do_uninstall
 
 hdr "cc-notifier install — role: $ROLE (port $PORT, dir $DIR)"
 if [ "$ROLE" = receiver ]; then
   write_receiver
-  write_sender          # the Mac may also run local CC
+  write_sender
+  write_config
   apply_port
   merge_hooks
   if [ "$OS" = Darwin ]; then
@@ -406,7 +407,7 @@ if [ "$ROLE" = receiver ]; then
   2. Break Focus: System Settings > Focus > (each mode) > allow the "alerter" app.
   3. Stop hotkey: Shortcuts app > new shortcut > Run Shell Script:  $DIR/cc_stop.sh
        then assign a key (e.g. Ctrl+Opt+Z). Avoid Cmd-combos & Ctrl+Opt+Space.
-  4. Pick sounds: $DIR/cc_preview_sounds.sh loop   (CC_ALARM_SOUND/CC_BEEP_SOUND/CC_ASK_SOUND)
+  4. Pick sounds / repeats: $DIR/cc_preview_sounds.sh loop   (set knobs in $DIR/config)
   5. For REMOTE machines: add to ~/.ssh/config under that host:
        RemoteForward $PORT localhost:$PORT
   Test now:  $DIR/cc_tunnel_test.sh beep   (and: $DIR/cc_tunnel_test.sh ask)

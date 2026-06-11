@@ -86,15 +86,29 @@ The arm flag lives at `~/.cc-notifier/armed` and persists across reboots.
 
 Merged idempotently — re-running the installer never duplicates hooks or clobbers your existing ones.
 
-## Configuration (env vars)
+## Configuration
+
+Sound, number of repeats, and spacing for the **long alarms** (`done` and `ask`) live in **`~/.cc-notifier/config`** on the Mac (created on install). Edit it — changes apply on the next alarm, no reload. The short **beep is always a single play** (its sound is configurable; repeats are not).
+
+```sh
+# ~/.cc-notifier/config
+CC_ALARM_SOUND=/System/Library/Sounds/Blow.aiff   # armed round-end alarm
+CC_ALARM_REPEATS=10                                # how many times the sound plays
+CC_ALARM_INTERVAL=1                                # seconds between plays
+CC_ASK_SOUND=/System/Library/Sounds/Funk.aiff      # "needs your input"
+CC_ASK_REPEATS=3
+CC_ASK_INTERVAL=1
+CC_BEEP_SOUND=/System/Library/Sounds/Glass.aiff    # disarmed chime (single play)
+```
+
+Preview options with `~/.cc-notifier/cc_preview_sounds.sh loop`.
+
+Sender-side env vars (on the machine running Claude Code):
 
 | Var | Default | Meaning |
 |---|---|---|
 | `CC_NOTIFY_PORT` | `28765` | listener port (use `install.sh --port N` to set everywhere) |
 | `CC_NOTIFY_MIN_SECONDS` | `20` | skip round-end notify for shorter turns (`0` = always) |
-| `CC_ALARM_SOUND` | `Blow` | armed alarm sound (`/System/Library/Sounds/*.aiff`) |
-| `CC_BEEP_SOUND` | `Glass` | disarmed chime |
-| `CC_ASK_SOUND` | `Funk` | "needs your input" sound |
 
 ## Troubleshooting
 
@@ -107,6 +121,19 @@ Merged idempotently — re-running the installer never duplicates hooks or clobb
 ```bash
 bash install.sh --uninstall     # removes hooks + launchd; leaves ~/.cc-notifier (rm -rf to finish)
 ```
+
+## Development
+
+`install.sh` is **generated** — don't edit it directly. The real sources live in `src/`:
+
+```
+src/sender/               hooks + arm/test scripts (run wherever Claude Code runs)
+src/receiver/             listener, alarms, sound/hotkey helpers (run on the Mac)
+src/install.template.sh   the installer framework
+build.sh                  bundles src/ into the self-contained install.sh
+```
+
+Edit a file under `src/`, run `./build.sh`, then commit both the source change and the regenerated `install.sh`.
 
 ## License
 
