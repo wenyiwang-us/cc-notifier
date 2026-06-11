@@ -33,6 +33,14 @@ The hooks are **identical** for local and remote use. The only difference: a rem
 
 ## Quick start
 
+Fetch the single installer — it auto-detects its role (macOS → receiver, Linux → sender):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wenyiwang-us/cc-notifier/main/install.sh -o install.sh
+```
+
+…or run it in one shot: `curl -fsSL https://raw.githubusercontent.com/wenyiwang-us/cc-notifier/main/install.sh | bash`
+
 ### 1. On your Mac (the notification target)
 
 ```bash
