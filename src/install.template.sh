@@ -162,6 +162,13 @@ if [ "$ROLE" = receiver ]; then
       fi
     fi
     install_launchd
+    if [ -d "$HOME/.config/karabiner" ]; then
+      mkdir -p "$HOME/.config/karabiner/assets/complex_modifications"
+      cp "$DIR/karabiner-stop.json" "$HOME/.config/karabiner/assets/complex_modifications/cc-notifier.json"
+      log "Karabiner rule staged — enable it in Karabiner › Complex Modifications › Add rule"
+    else
+      log "tip: install Karabiner-Elements + import $DIR/karabiner-stop.json for a hotkey that works in the CC chat box"
+    fi
     command -v alerter >/dev/null 2>&1 && alerter --title "cc-notifier" --message "installed — Allow notifications, then add 'alerter' to your Focus modes" --timeout 4 >/dev/null 2>&1 || true
   else
     log "NOTE: receiver role outside macOS — wrote files but skipped launchd/alerter."
@@ -170,8 +177,10 @@ if [ "$ROLE" = receiver ]; then
   cat <<EOF_NEXT
   1. macOS notifications: System Settings > Notifications > alerter -> Allow, style "Alerts".
   2. Break Focus: System Settings > Focus > (each mode) > allow the "alerter" app.
-  3. Stop hotkey: Shortcuts app > new shortcut > Run Shell Script:  $DIR/cc_stop.sh
-       then assign a key (e.g. Ctrl+Opt+Z). Avoid Cmd-combos & Ctrl+Opt+Space.
+  3. Stop hotkey (works in the CC chat box): Karabiner-Elements > Complex
+       Modifications > Add rule > Enable "cc-notifier: Ctrl+Opt+Z -> stop".
+       (No Karabiner? A macOS Shortcut running $DIR/cc_stop.sh works everywhere
+       EXCEPT the CC input box.)
   4. Pick sounds / repeats: $DIR/cc_preview_sounds.sh loop   (set knobs in $DIR/config)
   5. For REMOTE machines: add to ~/.ssh/config under that host:
        RemoteForward $PORT localhost:$PORT

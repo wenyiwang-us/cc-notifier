@@ -51,7 +51,7 @@ Then finish the one-time GUI steps the installer prints:
 
 1. **System Settings → Notifications → alerter** → Allow, style **Alerts**.
 2. **System Settings → Focus → (each mode)** → allow the **alerter** app (so notifications pierce Do-Not-Disturb / Work focus).
-3. **Stop hotkey:** Shortcuts app → new shortcut → *Run Shell Script* `~/.cc-notifier/cc_stop.sh` → assign a key (e.g. ⌃⌥Z; avoid ⌘-combos and ⌃⌥Space).
+3. **Stop hotkey** (works even in the Claude Code chat box): the installer stages a **Karabiner-Elements** rule — enable it in *Karabiner → Complex Modifications → Add rule → "cc-notifier: Ctrl+Opt+Z → stop"*. Karabiner intercepts the key at the device level, so it fires even when the CC input (a webview) has focus. Without Karabiner, a macOS Shortcut running `~/.cc-notifier/cc_stop.sh` works everywhere **except** the CC input box.
 4. Pick sounds: `~/.cc-notifier/cc_preview_sounds.sh loop`.
 
 ### 2. On a remote machine (where Claude Code runs)

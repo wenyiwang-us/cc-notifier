@@ -1,0 +1,20 @@
+{
+  "title": "cc-notifier",
+  "rules": [
+    {
+      "description": "cc-notifier: Ctrl+Opt+Z -> stop the alarm (works even in the Claude Code chat box)",
+      "manipulators": [
+        {
+          "type": "basic",
+          "from": {
+            "key_code": "z",
+            "modifiers": { "mandatory": ["control", "option"], "optional": ["caps_lock"] }
+          },
+          "to": [
+            { "shell_command": "$HOME/.cc-notifier/cc_stop.sh" }
+          ]
+        }
+      ]
+    }
+  ]
+}

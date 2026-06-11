@@ -11,6 +11,7 @@ emit_writer(){  # $1 = function name, $2 = src subdir
   local fn="$1" sub="$2" f n d
   printf '%s(){\n  mkdir -p "$DIR"\n' "$fn"
   for f in "$ROOT/src/$sub"/*; do
+    [ -f "$f" ] || continue          # skip dirs like __pycache__
     n="$(basename "$f")"
     d="CCN_EOF_${n//[.-]/_}"
     printf '  cat > "$DIR/%s" <<'\''%s'\''\n' "$n" "$d"
