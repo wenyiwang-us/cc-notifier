@@ -21,7 +21,7 @@
 
 _cc_focus_token() {
   if command -v shortcuts >/dev/null 2>&1; then
-    local n; n="$(shortcuts run CurrentFocus 2>/dev/null | tr -d '\r' | head -n1)"
+    local n; n="$(shortcuts run CurrentFocus --output-path - 2>/dev/null | tr -d '\r' | head -n1)"
     [ -n "$n" ] && { printf '%s' "$n"; return 0; }
   fi
   local A="$HOME/Library/DoNotDisturb/DB/Assertions.json"
