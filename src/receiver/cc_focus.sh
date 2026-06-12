@@ -21,7 +21,16 @@
 
 _cc_focus_token() {
   if command -v shortcuts >/dev/null 2>&1; then
-    local n; n="$(shortcuts run CurrentFocus --output-path - 2>/dev/null | tr -d '\r' | head -n1)"
+    # --output-path writes the result to a FILE (documented behavior); the
+    # shortcut must end with "Stop and Output" (or an output-producing action).
+    local tmp n=""
+    tmp="${TMPDIR:-/tmp}/cc_focus.$$"; rm -f "$tmp"
+    if shortcuts run CurrentFocus --output-path "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+      n="$(tr -d '\r' < "$tmp" | head -n1)"
+    fi
+    rm -f "$tmp"
+    # Fallback: some builds emit to stdout when it is a pipe.
+    [ -n "$n" ] || n="$(shortcuts run CurrentFocus 2>/dev/null | tr -d '\r' | head -n1)"
     [ -n "$n" ] && { printf '%s' "$n"; return 0; }
   fi
   local A="$HOME/Library/DoNotDisturb/DB/Assertions.json"
