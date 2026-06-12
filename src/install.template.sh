@@ -59,6 +59,14 @@ write_config(){
 # Optional phone push via Telegram (relayed from THIS Mac). See README for setup.
 #CC_TELEGRAM_TOKEN=123456789:ABCdef_your_bot_token
 #CC_TELEGRAM_CHAT_ID=123456789
+# Focus-aware sound: skip the alarm/beep AUDIO while these Focus modes are active
+# (space-separated substrings, case-insensitive vs the Shortcut name + raw mode
+# id). Empty = always play. Banner is gated separately via System Settings > Focus.
+# Needs a "CurrentFocus" Shortcut on the Mac — see README.
+#CC_MUTE_FOCUS="sleep donotdisturb.mode.default"
+# Escape hatch: route the sound through the notification so Apple gates it for
+# free (no detection) — but loses the looping alarm. 1 = on.
+#CC_SOUND_VIA_ALERTER=0
 CFG_EOF
   log "wrote config template: $cfg"
 }

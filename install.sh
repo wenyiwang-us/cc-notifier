@@ -244,10 +244,15 @@ write_receiver(){
   cat > "$DIR/_attention.sh" <<'CCN_EOF__attention_sh'
 #!/bin/bash
 # Shared engine for the long attention alarms (cc_alarm.sh / cc_ask.sh).
-# The caller sources this AFTER setting: SOUND, REPEATS, INTERVAL, TITLE, MSG,
-# BUTTON, TIMEOUT. Plays SOUND, REPEATS times, INTERVAL seconds apart, while
-# showing a persistent alert with one button; any click (or /stop) silences it.
-# Optional phone push via Telegram if CC_TELEGRAM_TOKEN + CC_TELEGRAM_CHAT_ID set.
+# Caller sources this AFTER setting: SOUND, REPEATS, INTERVAL, TITLE, MSG,
+# BUTTON, TIMEOUT. Plays SOUND, REPEATS times, INTERVAL apart, with a persistent
+# alert (one button); any click (or /stop) silences it.
+#
+# The SOUND is gated by the active macOS Focus (cc_focus.sh): muted in
+# Sleep / Do-Not-Disturb, played otherwise. The banner is gated independently by
+# the per-app Focus allow-list. CC_SOUND_VIA_ALERTER=1 routes the sound through
+# the notification instead of the afplay loop (Apple gates it for free; no loop).
+# Optional Telegram push if CC_TELEGRAM_TOKEN + CC_TELEGRAM_CHAT_ID set.
 find_bin(){ for p in "$@"; do [ -n "$p" ] && [ -x "$p" ] && { printf '%s' "$p"; return 0; }; done; return 1; }
 
 # Which session/host finished (passed by the hook via ?label=...).
@@ -260,13 +265,20 @@ if [ -n "${CC_TELEGRAM_TOKEN:-}" ] && [ -n "${CC_TELEGRAM_CHAT_ID:-}" ]; then
     --data-urlencode "text=${TITLE}: ${MSG}" >/dev/null 2>&1 &
 fi
 
-# --- beeps ---
-( for ((i = 1; i <= REPEATS; i++)); do
-    afplay "$SOUND"
-    [ "$i" -lt "$REPEATS" ] && sleep "$INTERVAL"
-  done ) &
-_BEEP=$!
-_stop(){ kill "$_BEEP" 2>/dev/null; pkill -P "$_BEEP" afplay 2>/dev/null; }
+# --- beeps: afplay loop, gated by the active Focus (loop preserved) ---
+[ -f "$HERE/cc_focus.sh" ] && . "$HERE/cc_focus.sh"
+_BEEP=""
+if [ "${CC_SOUND_VIA_ALERTER:-0}" != 1 ]; then
+  ( if ! command -v cc_should_play >/dev/null 2>&1 || cc_should_play; then
+      for ((i = 1; i <= REPEATS; i++)); do
+        afplay "$SOUND"
+        [ "$i" -lt "$REPEATS" ] && sleep "$INTERVAL"
+      done
+    fi ) &
+  _BEEP=$!
+fi
+_stop(){ [ -n "$_BEEP" ] && { kill "$_BEEP" 2>/dev/null; pkill -P "$_BEEP" afplay 2>/dev/null; }; }
+_wait(){ [ -n "$_BEEP" ] && wait "$_BEEP" 2>/dev/null; }
 
 # Static hint: the stop hotkey (read from Karabiner) + how it's configured to play.
 PYBIN="$(command -v python3 || echo /usr/bin/python3)"
@@ -275,15 +287,18 @@ INFO="auto-off ${TIMEOUT:-60}s · ${REPEATS}x$(basename "${SOUND%.*}")"
 [ -n "$HOTKEY" ] && INFO="${HOTKEY} to stop · ${INFO}"
 BANNER="$MSG  (${INFO})"
 
+# When routing sound through the notification (escape hatch), attach it.
+SND=(); [ "${CC_SOUND_VIA_ALERTER:-0}" = 1 ] && SND=(--sound "$(basename "${SOUND%.*}")")
+
 ALERTER="$(find_bin "$(command -v alerter 2>/dev/null)" /opt/homebrew/bin/alerter /usr/local/bin/alerter)"
 TN="$(find_bin "$(command -v terminal-notifier 2>/dev/null)" /opt/homebrew/bin/terminal-notifier /usr/local/bin/terminal-notifier)"
 if [ -n "$ALERTER" ]; then
-  "$ALERTER" --title "$TITLE" --message "$BANNER" --actions "${BUTTON:-Stop}" --timeout "${TIMEOUT:-60}" >/dev/null 2>&1
+  "$ALERTER" --title "$TITLE" --message "$BANNER" --actions "${BUTTON:-Stop}" --timeout "${TIMEOUT:-60}" "${SND[@]}" >/dev/null 2>&1
   _stop
 elif [ -n "$TN" ]; then
-  "$TN" -title "$TITLE" -message "$BANNER" -group cc-notifier >/dev/null 2>&1; wait "$_BEEP" 2>/dev/null
+  "$TN" -title "$TITLE" -message "$BANNER" -group cc-notifier >/dev/null 2>&1; _wait
 else
-  osascript -e "display notification \"$BANNER\" with title \"$TITLE\"" >/dev/null 2>&1; wait "$_BEEP" 2>/dev/null
+  osascript -e "display notification \"$BANNER\" with title \"$TITLE\"" >/dev/null 2>&1; _wait
 fi
 CCN_EOF__attention_sh
   cat > "$DIR/cc_alarm_listener.py" <<'CCN_EOF_cc_alarm_listener_py'
@@ -415,10 +430,12 @@ TIMEOUT="${CC_ASK_TIMEOUT:-120}"
 CCN_EOF_cc_ask_sh
   cat > "$DIR/cc_beep.sh" <<'CCN_EOF_cc_beep_sh'
 #!/bin/bash
-# Short chime — ALWAYS a single play (sound is configurable, repeats are not).
+# Short chime — single play, gated by the active macOS Focus (cc_focus.sh):
+# muted in Sleep / Do-Not-Disturb, played otherwise. Sound configurable; no repeats.
 HERE="$(cd "$(dirname "$0")" && pwd)"; [ -f "$HERE/config" ] && . "$HERE/config"
 SOUND="${CC_BEEP_SOUND:-/System/Library/Sounds/Glass.aiff}"
-afplay "$SOUND"
+[ -f "$HERE/cc_focus.sh" ] && . "$HERE/cc_focus.sh"
+if ! command -v cc_should_play >/dev/null 2>&1 || cc_should_play; then afplay "$SOUND"; fi
 CCN_EOF_cc_beep_sh
   cat > "$DIR/cc_check_hotkeys.py" <<'CCN_EOF_cc_check_hotkeys_py'
 #!/usr/bin/env python3
@@ -446,6 +463,60 @@ def main():
     print("\nApp-menu & third-party global hotkeys are NOT listed — also check System Settings > Keyboard > Keyboard Shortcuts.")
 if __name__=="__main__": main()
 CCN_EOF_cc_check_hotkeys_py
+  cat > "$DIR/cc_focus.sh" <<'CCN_EOF_cc_focus_sh'
+#!/bin/bash
+# Decide whether the alarm/beep SOUND should play under the active macOS Focus.
+# Source this, then call cc_should_play: returns 0 = PLAY, 1 = MUTE.
+#
+# afplay is direct audio, not a notification, so Focus/DND can't mute it — we
+# detect the active Focus ourselves and skip afplay in the muted modes. The
+# banner is gated separately by the per-app Focus allow-list (System Settings).
+#
+# Detection, in order:
+#   1. `shortcuts run CurrentFocus` — a 1-action "Get Current Focus" Shortcut you
+#      create once (no Full Disk Access; sees scheduled + manual focuses).
+#   2. ~/Library/DoNotDisturb/DB/Assertions.json — fallback (may need Full Disk
+#      Access; misses scheduled focuses). Parsed with python3 (no jq dependency).
+#   Undetected/unknown => PLAY (never silently swallow an alarm).
+#
+# Config (~/.cc-notifier/config):
+#   CC_MUTE_FOCUS   space-separated substrings to mute on (case-insensitive),
+#                   matched against the Shortcut name AND the raw mode id.
+#   CC_FOCUS_DEBUG  1 => print the detected token to stderr.
+: "${CC_MUTE_FOCUS:=sleep donotdisturb.mode.default}"
+
+_cc_focus_token() {
+  if command -v shortcuts >/dev/null 2>&1; then
+    local n; n="$(shortcuts run CurrentFocus 2>/dev/null | tr -d '\r' | head -n1)"
+    [ -n "$n" ] && { printf '%s' "$n"; return 0; }
+  fi
+  local A="$HOME/Library/DoNotDisturb/DB/Assertions.json"
+  if [ -r "$A" ]; then
+    local PYB; PYB="$(command -v python3 || echo /usr/bin/python3)"
+    "$PYB" -c 'import sys, json
+try:
+    d = json.load(open(sys.argv[1]))
+    recs = (d.get("data") or [{}])[0].get("storeAssertionRecords") or []
+    r = max(recs, key=lambda x: x.get("assertionDetails", {}).get("assertionStartDateTimestamp", 0)) if recs else {}
+    sys.stdout.write(r.get("assertionDetails", {}).get("assertionDetailsModeIdentifier", ""))
+except Exception:
+    pass' "$A" 2>/dev/null
+  fi
+}
+
+cc_should_play() {
+  local tok; tok="$(_cc_focus_token)"
+  [ "${CC_FOCUS_DEBUG:-0}" = 1 ] && printf 'cc-focus: token=[%s] mute=[%s]\n' "$tok" "$CC_MUTE_FOCUS" >&2
+  [ -z "$tok" ] && return 0                          # unknown -> PLAY
+  local lc m mm; lc="$(printf '%s' "$tok" | tr '[:upper:]' '[:lower:]')"
+  for m in $CC_MUTE_FOCUS; do
+    mm="$(printf '%s' "$m" | tr '[:upper:]' '[:lower:]')"
+    case "$lc" in *"$mm"*) return 1;; esac
+  done
+  case "$lc" in *"do not disturb"*) return 1;; esac   # Shortcut display name for DND
+  return 0
+}
+CCN_EOF_cc_focus_sh
   cat > "$DIR/cc_hotkey.py" <<'CCN_EOF_cc_hotkey_py'
 #!/usr/bin/env python3
 """Print the cc-notifier stop hotkey as a chord (e.g. "⌃⌥Z"), read from the
@@ -569,6 +640,14 @@ write_config(){
 # Optional phone push via Telegram (relayed from THIS Mac). See README for setup.
 #CC_TELEGRAM_TOKEN=123456789:ABCdef_your_bot_token
 #CC_TELEGRAM_CHAT_ID=123456789
+# Focus-aware sound: skip the alarm/beep AUDIO while these Focus modes are active
+# (space-separated substrings, case-insensitive vs the Shortcut name + raw mode
+# id). Empty = always play. Banner is gated separately via System Settings > Focus.
+# Needs a "CurrentFocus" Shortcut on the Mac — see README.
+#CC_MUTE_FOCUS="sleep donotdisturb.mode.default"
+# Escape hatch: route the sound through the notification so Apple gates it for
+# free (no detection) — but loses the looping alarm. 1 = on.
+#CC_SOUND_VIA_ALERTER=0
 CFG_EOF
   log "wrote config template: $cfg"
 }

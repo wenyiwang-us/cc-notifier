@@ -134,6 +134,26 @@ Get a Telegram message on your phone alongside the Mac alarm — free, and it us
    ```
 5. Test: `~/.cc-notifier/cc_tunnel_test.sh alarm` → expect a Telegram push.
 
+## Focus modes (break through Work, stay quiet in Sleep / Do Not Disturb)
+
+The **banner** and the **sound** are gated separately.
+
+**Banner** — pure System Settings, no code:
+- System Settings → Notifications → **alerter** → Allow, style **Alerts**.
+- System Settings → Focus → **Work** → Allowed Notifications → **add alerter**.
+- Focus → **Sleep** and **Do Not Disturb** → make sure **alerter is *not*** allowed.
+
+**Sound** — `afplay` isn't a notification, so Focus can't mute it; cc-notifier detects the active Focus and skips the sound itself:
+1. **Create the detector Shortcut once:** Shortcuts.app → new shortcut named exactly **`CurrentFocus`** → add the **Get Current Focus** action → save. Verify with `shortcuts run CurrentFocus` (prints the active focus name).
+2. The sound is muted while the active Focus matches **`CC_MUTE_FOCUS`** in `~/.cc-notifier/config` (default `sleep donotdisturb.mode.default`).
+3. **Self-test** per mode: `source ~/.cc-notifier/cc_focus.sh; CC_FOCUS_DEBUG=1 cc_should_play; echo play=$?` (0 = plays, 1 = muted), then `bash ~/.cc-notifier/cc_beep.sh` (chimes in Work/none, silent in Sleep/DND).
+
+Caveats:
+- Detection **fails safe to PLAY** when it can't tell — a miss leaks a sound rather than swallowing an alarm, so verify on your build.
+- If your Sleep mode's identifier differs, add its substring to `CC_MUTE_FOCUS`.
+- The `~/Library/DoNotDisturb/DB/Assertions.json` fallback needs Full Disk Access and misses *scheduled* focuses — the `CurrentFocus` Shortcut avoids both, so create it.
+- Don't trust detection? Set **`CC_SOUND_VIA_ALERTER=1`**: the sound rides the notification and Apple's Focus allow-list gates it for free (no detection) — but you lose the looping alarm.
+
 ## Troubleshooting
 
 **First run `~/.cc-notifier/cc_doctor.sh`** — it checks every link (listener, tunnel, auth, IPv4/IPv6, alerter, Karabiner, Telegram) and prints the specific fix. Common cases:
