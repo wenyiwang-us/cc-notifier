@@ -49,8 +49,8 @@ bash install.sh          # auto-detects macOS → receiver role
 
 Then finish the one-time GUI steps the installer prints:
 
-1. **System Settings → Notifications → alerter** → Allow, style **Alerts**.
-2. **System Settings → Focus → (each mode)** → allow the **alerter** app (so notifications pierce Do-Not-Disturb / Work focus).
+1. **System Settings → Notifications → Terminal** → Allow, style **Alerts**. (alerter posts under Terminal's identity — it has no entry of its own; see the Focus section.)
+2. **System Settings → Focus → Work** → Allowed Notifications → add **Terminal** (so notifications pierce that Focus; keep it out of Sleep/DND).
 3. **Stop hotkey** (works even in the Claude Code chat box): the installer stages a **Karabiner-Elements** rule — enable it in *Karabiner → Complex Modifications → Add rule → "cc-notifier: Ctrl+Opt+Z → stop"*. Karabiner intercepts the key at the device level, so it fires even when the CC input (a webview) has focus. Without Karabiner, a macOS Shortcut running `~/.cc-notifier/cc_stop.sh` works everywhere **except** the CC input box.
 4. Pick sounds: `~/.cc-notifier/cc_preview_sounds.sh loop`.
 
@@ -140,12 +140,13 @@ The **banner** and the **sound** are gated by different mechanisms — set up bo
 
 ### Banner — pure System Settings, no code
 
-1. **System Settings → Notifications → alerter** → Allow Notifications ON, style **Alerts** (Alerts persist and show the Stop button; Banners don't).
+⚠️ **alerter never appears under its own name** in System Settings — its notifications are attributed to **Terminal** in both the Notifications pane and the Focus app picker. Configure **Terminal** everywhere. (If your build does show an "alerter" entry, configure that instead.)
+
+1. **System Settings → Notifications → Terminal** → Allow Notifications ON, style **Alerts** (Alerts persist and show the Stop button; Banners don't).
 2. **System Settings → Focus → Work → Allowed Notifications → Apps → ＋ add `Terminal`.**
-   ⚠️ **Add *Terminal*, not alerter.** alerter does **not** appear in the Focus app picker — its notifications are attributed to **Terminal** for Focus filtering, even though the Notifications pane lists them under "alerter". The two panels disagree; this is the #1 trap.
 3. **Focus → Sleep** and **Focus → Do Not Disturb** → make sure **Terminal is *not*** in their allowed lists.
 
-Side effect of step 2: anything else Terminal posts will also break through Work. Usually negligible.
+Side effect: anything else Terminal posts will also break through Work. Usually negligible.
 
 ### Sound — needs the Focus-detector Shortcut
 
@@ -181,7 +182,7 @@ Caveats:
 **First run `~/.cc-notifier/cc_doctor.sh`** — it checks every link (listener, tunnel, auth, IPv4/IPv6, alerter, Karabiner, Telegram) and prints the specific fix. Common cases:
 
 - **No beep, `cc_tunnel_test.sh ping` fails with exit 56** — the reverse tunnel is stale. From your Mac: `ssh -O cancel -R 28765:localhost:28765 <host>; ssh -O forward -R 28765:localhost:28765 <host>`.
-- **Sound plays but no visual alert** — grant `alerter` notification permission (Alerts style) and allow it in your Focus modes.
+- **Sound plays but no visual alert** — grant **Terminal** notification permission (Alerts style) and allow **Terminal** in your Focus mode's apps (alerter posts under Terminal's identity).
 - **Stop hotkey only works when a window is focused** — the combo is already taken (e.g. ⌃⌥Space = input-source switch). Pick a free one; `~/.cc-notifier/cc_check_hotkeys.py <key>` lists system shortcuts.
 
 ## Uninstall

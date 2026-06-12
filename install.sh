@@ -770,16 +770,17 @@ if [ "$ROLE" = receiver ]; then
     else
       log "tip: install Karabiner-Elements + import $DIR/karabiner-stop.json for a hotkey that works in the CC chat box"
     fi
-    command -v alerter >/dev/null 2>&1 && alerter --title "cc-notifier" --message "installed — Allow notifications (Alerts style); for Focus, allow Terminal in Work" --timeout 4 >/dev/null 2>&1 || true
+    command -v alerter >/dev/null 2>&1 && alerter --title "cc-notifier" --message "installed — allow Terminal notifications (Alerts style); for Focus, allow Terminal in Work" --timeout 4 >/dev/null 2>&1 || true
   else
     log "NOTE: receiver role outside macOS — wrote files but skipped launchd/alerter."
   fi
   hdr "manual steps (one-time, GUI)"
   cat <<EOF_NEXT
-  1. macOS notifications: System Settings > Notifications > alerter -> Allow, style "Alerts".
+  1. macOS notifications: System Settings > Notifications > Terminal -> Allow,
+       style "Alerts". (alerter posts under Terminal's identity — it has no
+       entry of its own in either pane.)
   2. Break Focus (banner): System Settings > Focus > Work > Allowed Notifications
-       > Apps > add "Terminal" (NOT alerter — it isn't listed there; its
-       notifications count as Terminal). Keep Terminal OUT of Sleep / DND.
+       > Apps > add "Terminal". Keep Terminal OUT of Sleep / DND.
   3. Focus-aware sound: in Shortcuts.app create a shortcut named exactly
        "CurrentFocus" with TWO actions: [Get Current Focus] then
        [Stop and Output <Current Focus>]. The Stop-and-Output step is REQUIRED.
