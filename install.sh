@@ -770,20 +770,26 @@ if [ "$ROLE" = receiver ]; then
     else
       log "tip: install Karabiner-Elements + import $DIR/karabiner-stop.json for a hotkey that works in the CC chat box"
     fi
-    command -v alerter >/dev/null 2>&1 && alerter --title "cc-notifier" --message "installed — Allow notifications, then add 'alerter' to your Focus modes" --timeout 4 >/dev/null 2>&1 || true
+    command -v alerter >/dev/null 2>&1 && alerter --title "cc-notifier" --message "installed — Allow notifications (Alerts style); for Focus, allow Terminal in Work" --timeout 4 >/dev/null 2>&1 || true
   else
     log "NOTE: receiver role outside macOS — wrote files but skipped launchd/alerter."
   fi
   hdr "manual steps (one-time, GUI)"
   cat <<EOF_NEXT
   1. macOS notifications: System Settings > Notifications > alerter -> Allow, style "Alerts".
-  2. Break Focus: System Settings > Focus > (each mode) > allow the "alerter" app.
-  3. Stop hotkey (works in the CC chat box): Karabiner-Elements > Complex
+  2. Break Focus (banner): System Settings > Focus > Work > Allowed Notifications
+       > Apps > add "Terminal" (NOT alerter — it isn't listed there; its
+       notifications count as Terminal). Keep Terminal OUT of Sleep / DND.
+  3. Focus-aware sound: in Shortcuts.app create a shortcut named exactly
+       "CurrentFocus" with TWO actions: [Get Current Focus] then
+       [Stop and Output <Current Focus>]. The Stop-and-Output step is REQUIRED.
+       Verify: shortcuts run CurrentFocus --output-path /tmp/f.txt && cat /tmp/f.txt
+  4. Stop hotkey (works in the CC chat box): Karabiner-Elements > Complex
        Modifications > Add rule > Enable "cc-notifier: Ctrl+Opt+Z -> stop".
        (No Karabiner? A macOS Shortcut running $DIR/cc_stop.sh works everywhere
        EXCEPT the CC input box.)
-  4. Pick sounds / repeats: $DIR/cc_preview_sounds.sh loop   (set knobs in $DIR/config)
-  5. For REMOTE machines: add to ~/.ssh/config under that host:
+  5. Pick sounds / repeats: $DIR/cc_preview_sounds.sh loop   (set knobs in $DIR/config)
+  6. For REMOTE machines: add to ~/.ssh/config under that host:
        RemoteForward $PORT localhost:$PORT
   Test now:  $DIR/cc_tunnel_test.sh beep   (and: $DIR/cc_tunnel_test.sh ask)
   Arm/disarm any session:  $DIR/cc_notify_arm.sh on | off | status

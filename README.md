@@ -136,23 +136,45 @@ Get a Telegram message on your phone alongside the Mac alarm — free, and it us
 
 ## Focus modes (break through Work, stay quiet in Sleep / Do Not Disturb)
 
-The **banner** and the **sound** are gated separately.
+The **banner** and the **sound** are gated by different mechanisms — set up both. (These steps are verified on macOS Tahoe 26.)
 
-**Banner** — pure System Settings, no code:
-- System Settings → Notifications → **alerter** → Allow, style **Alerts**.
-- System Settings → Focus → **Work** → Allowed Notifications → **add alerter**.
-- Focus → **Sleep** and **Do Not Disturb** → make sure **alerter is *not*** allowed.
+### Banner — pure System Settings, no code
 
-**Sound** — `afplay` isn't a notification, so Focus can't mute it; cc-notifier detects the active Focus and skips the sound itself:
-1. **Create the detector Shortcut once:** Shortcuts.app → new shortcut named exactly **`CurrentFocus`** → add the **Get Current Focus** action → save. Verify with `shortcuts run CurrentFocus` (prints the active focus name).
-2. The sound is muted while the active Focus matches **`CC_MUTE_FOCUS`** in `~/.cc-notifier/config` (default `sleep donotdisturb.mode.default`).
-3. **Self-test** per mode: `source ~/.cc-notifier/cc_focus.sh; CC_FOCUS_DEBUG=1 cc_should_play; echo play=$?` (0 = plays, 1 = muted), then `bash ~/.cc-notifier/cc_beep.sh` (chimes in Work/none, silent in Sleep/DND).
+1. **System Settings → Notifications → alerter** → Allow Notifications ON, style **Alerts** (Alerts persist and show the Stop button; Banners don't).
+2. **System Settings → Focus → Work → Allowed Notifications → Apps → ＋ add `Terminal`.**
+   ⚠️ **Add *Terminal*, not alerter.** alerter does **not** appear in the Focus app picker — its notifications are attributed to **Terminal** for Focus filtering, even though the Notifications pane lists them under "alerter". The two panels disagree; this is the #1 trap.
+3. **Focus → Sleep** and **Focus → Do Not Disturb** → make sure **Terminal is *not*** in their allowed lists.
+
+Side effect of step 2: anything else Terminal posts will also break through Work. Usually negligible.
+
+### Sound — needs the Focus-detector Shortcut
+
+`afplay` is raw audio, not a notification, so Focus can never mute it. cc-notifier detects the active Focus itself and skips the sound in muted modes. The detector is a Shortcut, and **it must be built exactly like this** (a bare "Get Current Focus" produces *no* CLI output):
+
+1. Shortcuts.app → ＋ new shortcut → name it exactly **`CurrentFocus`**.
+2. Add action **Get Current Focus**.
+3. Add action **Stop and Output** → set its output to the **Current Focus** magic variable. **This step is required** — without "Stop and Output", `shortcuts run` returns nothing and detection silently degrades to always-play.
+4. Verify (turn any Focus on first):
+   ```bash
+   shortcuts run CurrentFocus --output-path /tmp/focus.txt && cat /tmp/focus.txt
+   ```
+   It should print the focus name (e.g. `Work`). No trailing newline — zsh shows a `%` after it; that's cosmetic. Note `--output-path` writes to a **file**; `-` is *not* stdout. The first run may pop a one-time automation permission prompt — allow it.
+5. The sound is muted while the detected Focus matches **`CC_MUTE_FOCUS`** in `~/.cc-notifier/config` (default `sleep donotdisturb.mode.default`, matched case-insensitively; "Do Not Disturb" is also caught by name).
+
+**Self-test** per mode:
+```bash
+source ~/.cc-notifier/cc_focus.sh; CC_FOCUS_DEBUG=1 cc_should_play; echo play=$?
+#   Work / no Focus -> play=0 (sounds)     Sleep / DND -> play=1 (muted)
+~/.cc-notifier/cc_tunnel_test.sh beep     # chime in Work/none, silent in Sleep/DND
+~/.cc-notifier/cc_tunnel_test.sh alarm    # in Work: loop + banner with Stop button
+```
 
 Caveats:
-- Detection **fails safe to PLAY** when it can't tell — a miss leaks a sound rather than swallowing an alarm, so verify on your build.
+- Detection **fails safe to PLAY** when it can't tell (no Shortcut, empty output) — a miss leaks a sound rather than swallowing an alarm. So if sounds ignore your Focus, the Shortcut is misbuilt — recheck step 3.
+- Expect ~1–2s of extra latency before the sound (the `shortcuts` call runs first).
 - If your Sleep mode's identifier differs, add its substring to `CC_MUTE_FOCUS`.
-- The `~/Library/DoNotDisturb/DB/Assertions.json` fallback needs Full Disk Access and misses *scheduled* focuses — the `CurrentFocus` Shortcut avoids both, so create it.
-- Don't trust detection? Set **`CC_SOUND_VIA_ALERTER=1`**: the sound rides the notification and Apple's Focus allow-list gates it for free (no detection) — but you lose the looping alarm.
+- The `~/Library/DoNotDisturb/DB/Assertions.json` fallback is TCC-blocked on Tahoe (permission denied even in Terminal) and misses scheduled focuses — don't rely on it; build the Shortcut.
+- Don't trust detection? Set **`CC_SOUND_VIA_ALERTER=1`**: the sound rides the notification and the Focus allow-list gates it for free — but you lose the looping alarm.
 
 ## Troubleshooting
 
