@@ -67,6 +67,10 @@ write_config(){
 # Escape hatch: route the sound through the notification so Apple gates it for
 # free (no detection) — but loses the looping alarm. 1 = on.
 #CC_SOUND_VIA_ALERTER=0
+# Reverse-tunnel auto-heal (REMOTE setups): your ssh host alias for the machine
+# running Claude Code. Set this to enable the launchd keeper that re-injects the
+# RemoteForward after network changes / window reloads / wake. Empty = off.
+#CC_TUNNEL_HOST=aurora
 CFG_EOF
   log "wrote config template: $cfg"
 }
@@ -124,6 +128,28 @@ PLIST_EOF
   launchctl load "$plist" && log "launchd listener loaded (port $PORT)"
 }
 
+install_tunnel_keeper(){
+  local plist="$HOME/Library/LaunchAgents/com.ccnotifier.tunnel.plist"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$plist" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.ccnotifier.tunnel</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string><string>$DIR/cc_tunnel_keep.sh</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>60</integer>
+  <key>WatchPaths</key><array><string>/etc/resolv.conf</string></array>
+  <key>StandardOutPath</key><string>/tmp/ccnotifier.tunnel.log</string>
+  <key>StandardErrorPath</key><string>/tmp/ccnotifier.tunnel.log</string>
+</dict></plist>
+PLIST_EOF
+  launchctl unload "$plist" 2>/dev/null || true
+  launchctl load "$plist" && log "tunnel keeper loaded (re-heals the reverse tunnel every 60s + on network change; set CC_TUNNEL_HOST to enable)"
+}
+
 apply_port(){
   [ "$PORT" = "28765" ] && return 0
   find "$DIR" -type f \( -name '*.sh' -o -name '*.py' \) -exec sed -i.bak "s/28765/$PORT/g" {} \;
@@ -133,8 +159,12 @@ apply_port(){
 do_uninstall(){
   hdr "uninstall"
   if [ "$OS" = Darwin ]; then
-    local plist="$HOME/Library/LaunchAgents/com.ccnotifier.listener.plist"
-    launchctl unload "$plist" 2>/dev/null || true; rm -f "$plist"; log "launchd removed"
+    local p
+    for p in com.ccnotifier.listener com.ccnotifier.tunnel; do
+      p="$HOME/Library/LaunchAgents/$p.plist"
+      launchctl unload "$p" 2>/dev/null || true; rm -f "$p"
+    done
+    log "launchd agents removed"
   fi
   python3 - "$SETTINGS" "$DIR" <<'PYUNMERGE'
 import json, os, sys
@@ -173,6 +203,7 @@ if [ "$ROLE" = receiver ]; then
       fi
     fi
     install_launchd
+    install_tunnel_keeper
     if [ -d "$HOME/.config/karabiner" ]; then
       mkdir -p "$HOME/.config/karabiner/assets/complex_modifications"
       cp "$DIR/karabiner-stop.json" "$HOME/.config/karabiner/assets/complex_modifications/cc-notifier.json"
@@ -202,6 +233,9 @@ if [ "$ROLE" = receiver ]; then
   5. Pick sounds / repeats: $DIR/cc_preview_sounds.sh loop   (set knobs in $DIR/config)
   6. For REMOTE machines: add to ~/.ssh/config under that host:
        RemoteForward $PORT localhost:$PORT
+  7. Auto-heal the tunnel (REMOTE setups): set CC_TUNNEL_HOST=<your-ssh-alias>
+       in $DIR/config — the launchd keeper then re-injects the forward after
+       network changes / reloads / wake (no new ssh connections).
   Test now:  $DIR/cc_tunnel_test.sh beep   (and: $DIR/cc_tunnel_test.sh ask)
   Arm/disarm any session:  $DIR/cc_notify_arm.sh on | off | status
   Diagnose anytime:  $DIR/cc_doctor.sh

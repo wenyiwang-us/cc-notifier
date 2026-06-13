@@ -177,6 +177,16 @@ Caveats:
 - The `~/Library/DoNotDisturb/DB/Assertions.json` fallback is TCC-blocked on Tahoe (permission denied even in Terminal) and misses scheduled focuses — don't rely on it; build the Shortcut.
 - Don't trust detection? Set **`CC_SOUND_VIA_ALERTER=1`**: the sound rides the notification and the Focus allow-list gates it for free — but you lose the looping alarm.
 
+## Keeping the reverse tunnel alive (remote setups)
+
+The reverse tunnel rides your SSH connection, so a network change, window reload, or sleep can drop it (and `ControlPersist` may reuse a stale master that lost the forward). To self-heal, set your ssh host alias in `~/.cc-notifier/config`:
+
+```sh
+CC_TUNNEL_HOST=aurora
+```
+
+A launchd keeper (`com.ccnotifier.tunnel`, installed on the Mac) then checks the tunnel **every 60s and immediately on a network change** (it watches `/etc/resolv.conf`) and re-injects the `RemoteForward` if it's down. It only ever acts on your **existing** SSH master (shared `ControlPath`), so it opens **no new connections** (nothing for an HPC admin to flag) and keeps the forward on the same node as your session. The `SessionStart` healthcheck still warns in-session if the tunnel is down.
+
 ## Troubleshooting
 
 **First run `~/.cc-notifier/cc_doctor.sh`** — it checks every link (listener, tunnel, auth, IPv4/IPv6, alerter, Karabiner, Telegram) and prints the specific fix. Common cases:
