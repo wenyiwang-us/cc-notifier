@@ -8,3 +8,5 @@ __pycache__/
 .cc-notifier/
 armed
 turn_start
+sessions/
+tmp/

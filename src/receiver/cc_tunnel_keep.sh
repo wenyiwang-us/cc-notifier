@@ -13,7 +13,7 @@ HOST="${CC_TUNNEL_HOST:-}"
 ssh -O check "$HOST" >/dev/null 2>&1 || exit 0      # no live master -> nothing to inject into
 
 # Already healthy? Test the real remote->Mac path over the master (no new connection).
-ssh "$HOST" "curl -s -o /dev/null --max-time 2 http://localhost:${PORT}/ping" >/dev/null 2>&1 && exit 0
+ssh "$HOST" "curl -s --noproxy '*' -o /dev/null --max-time 2 http://localhost:${PORT}/ping" >/dev/null 2>&1 && exit 0
 
 # Broken (forward missing or stale) -> refresh it on the live master.
 ssh -O cancel  -R "${PORT}:localhost:${PORT}" "$HOST" >/dev/null 2>&1

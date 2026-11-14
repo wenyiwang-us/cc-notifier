@@ -9,7 +9,7 @@ bad(){  printf "  ${r}XX${z}  %s\n" "$*"; }
 warn(){ printf "  ${y}??${z}  %s\n" "$*"; }
 note(){ printf "  ..  %s\n" "$*"; }
 HDR=(); [ -f "$DIR/token" ] && HDR=(-H "X-CC-Token: $(cat "$DIR/token")")
-hc(){ curl -s --max-time 4 -o /dev/null -w '%{http_code}' "$@" 2>/dev/null; }
+hc(){ curl -s --noproxy '*' --max-time 4 -o /dev/null -w '%{http_code}' "$@" 2>/dev/null; }
 
 printf "cc-notifier doctor — %s (%s)\n" "$(uname -n)" "$OS"
 
@@ -20,6 +20,22 @@ else bad "listener NOT reachable (HTTP ${code:-none})"
   if [ "$OS" = Darwin ]; then note "fix: launchctl load ~/Library/LaunchAgents/com.ccnotifier.listener.plist"
   else note "fix (tunnel down): from your Mac  ssh -O forward -R ${PORT}:localhost:${PORT} <host>"; fi
 fi
+
+# --- listener version + hook helper (per-session alarms, session title, brief) ---
+if [ "$code" = 200 ]; then
+  body="$(curl -s --noproxy '*' --max-time 4 "http://localhost:${PORT}/ping" 2>/dev/null)"
+  proto=1; case "$body" in *proto=*) proto="${body##*proto=}"; proto="${proto%%[!0-9]*}";; esac
+  if   [ "${proto:-1}" -ge 5 ]; then ok "listener is current (protocol ${proto}): one alarm per session, agent name, summary in the alert, the whole message in the phone push"
+  elif [ "${proto:-1}" -ge 4 ]; then warn "listener is one version behind these hooks (protocol ${proto}, need 5): the phone push stops at 3,500 characters — re-run install.sh on the Mac"
+  elif [ "${proto:-1}" -ge 3 ]; then warn "listener is behind these hooks (protocol ${proto}, need 5): the phone push carries only the one-sentence summary — re-run install.sh on the Mac"
+  elif [ "${proto:-1}" -ge 2 ]; then warn "listener is behind these hooks (protocol ${proto}, need 5): no summary in the phone push, every alarm titled Claude Code — re-run install.sh on the Mac"
+  else warn "listener is older than these hooks (protocol ${proto:-1}, need 5): one shared alarm, no title/summary — re-run install.sh on the Mac"; fi
+fi
+PYBIN="$(command -v python3 || echo /usr/bin/python3)"
+[ "$("$PYBIN" "$DIR/cc_hook.py" check 2>/dev/null)" = "ok" ] && ok "hook helper runs ($PYBIN cc_hook.py)" \
+  || bad "hook helper cannot run ($PYBIN $DIR/cc_hook.py) — hooks fall back to always notifying, no brief"
+n="$(find "$DIR/sessions" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+note "per-session state: ${n} session(s) in $DIR/sessions; decisions are logged in $DIR/hook.log"
 
 # --- auth ---
 if [ -f "$DIR/token" ]; then
@@ -37,6 +53,10 @@ if command -v python3 >/dev/null 2>&1 && [ -f "$S" ]; then
   n="$(python3 -c "import json;d=json.load(open('$S'));print(sum('/.cc-notifier/' in h.get('command','') for e in d.get('hooks',{}).values() for grp in e for h in grp.get('hooks',[])))" 2>/dev/null)"
   [ "${n:-0}" -ge 4 ] && ok "CC hooks wired (${n}/4 in user settings)" \
                       || warn "CC hooks: ${n:-0}/4 in $S — run install.sh, then restart CC"
+fi
+if [ -d "${CODEX_HOME:-$HOME/.codex}" ] && [ -x "$DIR/cc_codex_hooks.sh" ]; then
+  if st="$("$DIR/cc_codex_hooks.sh" status 2>/dev/null)"; then ok "$st (Codex runs them once you have reviewed them there)"
+  else note "${st:-Codex hooks: not readable} — for round-end notifications from Codex: $DIR/cc_codex_hooks.sh on"; fi
 fi
 
 # --- receiver-only checks ---

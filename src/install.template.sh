@@ -4,14 +4,16 @@
 #
 #   bash install.sh            # auto-detect role from the OS
 #   bash install.sh receiver   # force the Mac receiver role
-#   bash install.sh sender     # force the CC-side sender role
+#   bash install.sh sender     # force the agent-side sender role
 #   bash install.sh --port 28765
+#   bash install.sh --codex    # also add the round-end hooks to Codex (~/.codex/hooks.json)
 #   bash install.sh --uninstall
 #
 # receiver (macOS): listener (launchd) + alerter + sounds + stop kit + local hooks.
 # sender   (Linux): hooks into ~/.claude/settings.json; remote senders reach the
 #                   Mac via an ssh RemoteForward. Notifies on round-complete (Stop)
-#                   and on questions (AskUserQuestion).
+#                   and on questions (AskUserQuestion). Codex uses the same hook
+#                   scripts once switched on (--codex, or cc_codex_hooks.sh on).
 set -euo pipefail
 
 PORT=28765
@@ -19,6 +21,7 @@ DIR="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"
 SETTINGS="${CC_NOTIFIER_SETTINGS:-$HOME/.claude/settings.json}"
 ROLE=""
 UNINSTALL=0
+CODEX=0
 OS="$(uname -s)"
 
 while [ $# -gt 0 ]; do
@@ -26,6 +29,7 @@ while [ $# -gt 0 ]; do
     receiver|sender) ROLE="$1"; shift;;
     --port) PORT="$2"; shift 2;;
     --uninstall) UNINSTALL=1; shift;;
+    --codex) CODEX=1; shift;;
     -h|--help) awk 'NR>1 && /^#/{sub(/^# ?/,"");print;next} NR>1{exit}' "$0"; exit 0;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
@@ -59,6 +63,14 @@ write_config(){
 # Optional phone push via Telegram (relayed from THIS Mac). See README for setup.
 #CC_TELEGRAM_TOKEN=123456789:ABCdef_your_bot_token
 #CC_TELEGRAM_CHAT_ID=123456789
+# The phone push carries the session title and the final message of the round,
+# whole (plain text, over as many Telegram messages as it takes). That is text
+# from your session; 0 keeps it on this Mac and sends the status and host/project
+# only.
+#CC_TELEGRAM_BRIEF=1
+# A message longer than this many characters shows its opening and folds the rest
+# into a quote you tap to expand, so the chat stays short. 0 = never fold.
+#CC_TELEGRAM_FOLD_CHARS=1500
 # Focus-aware sound: skip the alarm/beep AUDIO while these Focus modes are active
 # (space-separated substrings, case-insensitive vs the Shortcut name + raw mode
 # id). Empty = always play. Banner is gated separately via System Settings > Focus.
@@ -105,6 +117,16 @@ os.makedirs(os.path.dirname(settings_path) or ".", exist_ok=True)
 with open(settings_path, "w") as f: json.dump(cfg, f, indent=2)
 print("  hooks merged into", settings_path)
 PYMERGE
+}
+
+# Codex takes the same hook scripts. Its hooks file is the user's to change, so
+# this only happens on request; otherwise say how to switch it on.
+codex_hooks(){
+  [ -d "${CODEX_HOME:-$HOME/.codex}" ] || return 0
+  if [ "$CODEX" = 1 ]; then "$DIR/cc_codex_hooks.sh" on | sed 's/^/  /' || true
+  elif ! "$DIR/cc_codex_hooks.sh" status >/dev/null 2>&1; then
+    log "Codex found: for round-end notifications from it too, run  $DIR/cc_codex_hooks.sh on"
+  fi
 }
 
 install_launchd(){
@@ -181,6 +203,9 @@ for ev, arr in list(cfg.get("hooks", {}).items()):
 with open(settings_path, "w") as f: json.dump(cfg, f, indent=2)
 print("  hooks removed from", settings_path)
 PYUNMERGE
+  if [ -x "$DIR/cc_codex_hooks.sh" ] && [ -d "${CODEX_HOME:-$HOME/.codex}" ]; then
+    "$DIR/cc_codex_hooks.sh" off | grep -v 'already absent' | sed 's/^/  /' || true
+  fi
   log "(left $DIR in place — 'rm -rf $DIR' to fully remove)"
   exit 0
 }
@@ -194,6 +219,7 @@ if [ "$ROLE" = receiver ]; then
   write_config
   apply_port
   merge_hooks
+  codex_hooks
   if [ "$OS" = Darwin ]; then
     if ! command -v alerter >/dev/null 2>&1; then
       if command -v brew >/dev/null 2>&1; then
@@ -245,10 +271,12 @@ else
   write_sender
   apply_port
   merge_hooks
+  codex_hooks
   hdr "remote sender installed"
   cat <<EOF_NEXT
   Hooks wired into $SETTINGS (restart this CC session to load them).
   Notifies on round-complete (Stop) and questions (AskUserQuestion).
+  Anything else can notify too:  $DIR/cc_notify.sh --title "..." "one-sentence summary"
   This machine notifies your Mac THROUGH an ssh reverse tunnel. On your Mac:
     1. Add to ~/.ssh/config under the host you use for this machine:
          RemoteForward $PORT localhost:$PORT
