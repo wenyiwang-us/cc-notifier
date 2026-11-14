@@ -14,6 +14,7 @@ hc(){ curl -s --noproxy '*' --max-time 4 -o /dev/null -w '%{http_code}' "$@" 2>/
 # Asks the listener to prove it holds this machine's token; sends nothing else and
 # rings nothing. The token never travels and never appears on a command line.
 ping_out="$(CC_NOTIFY_PORT="$PORT" CC_NOTIFIER_DIR="$DIR" "$PYBIN" "$HERE/cc_client.py" ping 2>/dev/null)"
+if [ -f "$DIR/cc_alarm_listener.py" ]; then FIX="on this Mac: cc_token.sh new"; else FIX="on the Mac: cc_token.sh push <this host>"; fi
 
 printf "cc-notifier doctor — %s (%s)\n" "$(uname -n)" "$OS"
 
@@ -28,12 +29,14 @@ fi
 # --- listener version + auth (signed requests; the listener proves it holds the token) ---
 if [ "$code" = 200 ]; then
   case "$ping_out" in
-    proto=*\ verified=yes*) ok "listener is current and holds this machine's token (${ping_out%% *}): requests are signed, the token never travels";;
+    proto=*\ verified=yes\ as=shared*) warn "listener holds the key all machines share (${ping_out%% *}); requests are signed, but give this machine its own key — on the Mac: cc_token.sh push <this host>";;
+    proto=*\ verified=yes*) ok "listener is current and holds this machine's own key (${ping_out%% why=*}): requests are signed, the key never travels";;
     *legacy=yes*) warn "listener is protocol 5: it still gets the old token in a header — re-run install.sh on the Mac, then there: cc_token.sh rotate <this host>";;
-    *token=none*) bad "no token on this machine ($DIR/token): nothing is sent — on the Mac: cc_token.sh push <this host>";;
-    *listener_auth=none*) bad "the listener has no token, so it refuses everything — on the Mac: cc_token.sh new, then cc_token.sh push <each remote>";;
-    proto=[0-5]\ *) bad "listener is older than these hooks (${ping_out%% *}, need 6: signed requests), so nothing is sent to it — re-run install.sh on the Mac";;
-    *) bad "the listener cannot prove it holds this machine's token (${ping_out:-no answer}): the tokens differ (on the Mac: cc_token.sh push <this host>) or someone else holds port ${PORT} here — nothing is sent to it";;
+    *why=no_token*|*why=bad_key_name*) bad "no usable key on this machine ($DIR/token, $DIR/key-name): nothing is sent — $FIX";;
+    *why=key_unknown_at_listener*|*why=no_key_for_this_machine*) bad "the listener takes no key from this machine on this port (${ping_out##*why=}; or someone else holds port ${PORT} here): nothing is sent — $FIX";;
+    *why=listener_has_no_token*) bad "the listener has no token, so it refuses everything — re-run install.sh on the Mac";;
+    *why=old_listener*) bad "listener is older than these hooks (${ping_out%% *}), so nothing is sent to it — re-run install.sh on the Mac";;
+    *) bad "the listener cannot prove it holds this machine's key (${ping_out:-no answer}): the keys differ (on the Mac: cc_token.sh push <this host>) or someone else holds port ${PORT} here — nothing is sent to it";;
   esac
 fi
 [ "$("$PYBIN" "$DIR/cc_hook.py" check 2>/dev/null)" = "ok" ] && ok "hook helper runs ($PYBIN cc_hook.py)" \
@@ -41,8 +44,14 @@ fi
 n="$(find "$DIR/sessions" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
 note "per-session state: ${n} session(s) in $DIR/sessions; decisions are logged in $DIR/hook.log"
 
-# --- private files: the token, the config (Telegram bot token), the message texts ---
-for f in "$DIR" "$DIR/token" "$DIR/config" "$DIR/sessions" "$DIR/tmp"; do
+# --- keys the listener takes (Mac) ---
+if [ -d "$DIR/keys" ]; then
+  note "keys the listener takes (cc_token.sh keys): $("$DIR/cc_token.sh" keys 2>/dev/null | awk '{printf "%s=%s ", $1, $3}')"
+  [ -e "$DIR/keys/shared" ] && warn "the key all machines shared before is still taken on port ${PORT} — give each remote its own (cc_token.sh push <host>...), then: cc_token.sh revoke shared"
+fi
+
+# --- private files: the keys, the config (Telegram bot token), the message texts ---
+for f in "$DIR" "$DIR/token" "$DIR/key-name" "$DIR/keys" "$DIR"/keys/* "$DIR/ports" "$DIR/config" "$DIR/sessions" "$DIR/tmp" "$DIR/listener.log" "$DIR/tunnel.log"; do
   [ -e "$f" ] || continue
   m="$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null)"
   case "$m" in 700|600|500|400) ;; *) bad "$f is readable by others (mode $m) — chmod go= $f";; esac

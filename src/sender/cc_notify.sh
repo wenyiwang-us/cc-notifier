@@ -92,9 +92,10 @@ case "$res" in
 esac
 printf 'FAIL /%s -> %s\n' "$act" "$res" >&2
 case "$res" in
-  *err=no_token*) printf 'No token in %s: on the Mac, run  ~/.cc-notifier/cc_token.sh push <this host>\n' "$DIR" >&2;;
+  *err=no_token*|*err=key_unknown_at_listener*|*err=no_key_for_this_machine*|*err=bad_key_name*)
+    printf 'This machine has no key the listener takes (%s; or someone else holds port %s here): on the Mac, run  ~/.cc-notifier/cc_token.sh push <this host>  (on the Mac itself: cc_token.sh new)\n' "${res#* err=}" "$PORT" >&2;;
   *err=unverified*|*http=401*|*http=403*)
-    printf 'The listener did not take our signature: the two ends have different tokens (on the Mac: cc_token.sh push <this host>), or someone else holds port %s here.\n' "$PORT" >&2;;
+    printf 'The listener did not take our signature: the two ends have different keys (on the Mac: cc_token.sh push <this host>), or someone else holds port %s here.\n' "$PORT" >&2;;
   *err=old_listener*) printf 'The listener on the Mac is older than these hooks: re-run install.sh on the Mac.\n' >&2;;
   *) printf 'Check the listener/tunnel with %s/cc_tunnel_test.sh ping.\n' "$DIR" >&2;;
 esac

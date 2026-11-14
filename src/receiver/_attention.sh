@@ -7,6 +7,8 @@
 # The sender says what this is about (through the listener):
 #   CC_AGENT  who is notifying (Claude Code, Codex, ...) -> TITLE, set by the caller
 #   CC_LABEL  host/project             -> appended to the status line
+#   CC_KEY    the machine whose key signed the request (set by the listener, not
+#             the sender) -> leads the status line unless it is this Mac's own
 #   CC_TITLE  session title            -> the alert's subtitle
 #   CC_BRIEF  one-sentence summary of the round, or the question asked -> leads the body
 #   CC_BODY_FILE  file with the final message as plain text (line breaks, any length)
@@ -22,8 +24,11 @@
 # CC_TELEGRAM_BRIEF=0 sends the status line only.
 find_bin(){ for p in "$@"; do [ -n "$p" ] && [ -x "$p" ] && { printf '%s' "$p"; return 0; }; done; return 1; }
 
-# Which session/host finished (passed by the hook via ?label=...).
-[ -n "${CC_LABEL:-}" ] && MSG="$MSG — $CC_LABEL"
+# Which machine (verified by its key) and session/host finished (?label=... is the sender's word).
+case "${CC_KEY:-local}" in
+  local) [ -n "${CC_LABEL:-}" ] && MSG="$MSG — $CC_LABEL";;
+  *)     MSG="$MSG — ${CC_KEY}${CC_LABEL:+: $CC_LABEL}";;
+esac
 
 # --- optional phone push (relayed from THIS Mac; senders like Aurora may block Telegram) ---
 if [ -n "${CC_TELEGRAM_TOKEN:-}" ] && [ -n "${CC_TELEGRAM_CHAT_ID:-}" ]; then

@@ -48,12 +48,40 @@ hdr(){ printf '\n== %s ==\n' "$*"; }
 # files are written: a token, but no cc_client.py yet.
 FROM_OLD=0
 [ -s "$DIR/token" ] && [ ! -f "$DIR/cc_client.py" ] && FROM_OLD=1
+# Before protocol 7 every machine shared one token (a token, no key-name).
+FROM_SHARED=0
+[ -s "$DIR/token" ] && [ ! -s "$DIR/key-name" ] && FROM_SHARED=1
 
 secure_files(){
   chmod 700 "$DIR"
   local f
-  for f in token config legacy-token.sha256; do [ -f "$DIR/$f" ] && chmod 600 "$DIR/$f"; done
-  for f in sessions tmp; do [ -d "$DIR/$f" ] && chmod 700 "$DIR/$f"; done
+  for f in token key-name config legacy-token.sha256 listener.log tunnel.log; do [ -f "$DIR/$f" ] && chmod 600 "$DIR/$f"; done
+  for f in sessions tmp keys ports; do [ -d "$DIR/$f" ] && chmod 700 "$DIR/$f"; done
+  return 0
+}
+
+# The listener keeps one key per machine (keys/<name>) and, for each remote, the
+# port its tunnel ends at (ports/<name>). The token all machines shared before
+# stays as keys/shared until `cc_token.sh revoke shared`; this Mac's own senders
+# get keys/local. Keys the listener reads come first, before it is (re)started ...
+receiver_keys(){
+  mkdir -p "$DIR/keys" "$DIR/ports"; chmod 700 "$DIR/keys" "$DIR/ports"
+  if [ "$FROM_SHARED" = 1 ] && [ ! -e "$DIR/keys/shared" ]; then cp "$DIR/token" "$DIR/keys/shared"; fi
+  if [ ! -s "$DIR/keys/local" ]; then
+    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$DIR/keys/local.new" && [ -s "$DIR/keys/local.new" ] \
+      && mv -f "$DIR/keys/local.new" "$DIR/keys/local" \
+      && log "made this Mac's own key ($DIR/keys/local); every request is signed with a key the listener has, nothing else is carried out" \
+      || { echo "ERROR: could not make this Mac's own key in $DIR/keys" >&2; exit 1; }
+  fi
+  return 0
+}
+# ... and this Mac's own senders switch to its key after (repaired when it does not match).
+own_key(){
+  if ! cmp -s "$DIR/keys/local" "$DIR/token" || [ "$(cat "$DIR/key-name" 2>/dev/null)" != local ]; then
+    cp "$DIR/keys/local" "$DIR/token.tmp" && chmod 600 "$DIR/token.tmp" && mv -f "$DIR/token.tmp" "$DIR/token" \
+      && echo local > "$DIR/key-name" \
+      || { echo "ERROR: could not give this Mac's senders its key ($DIR/token, $DIR/key-name)" >&2; exit 1; }
+  fi
   return 0
 }
 
@@ -63,41 +91,52 @@ write_sender(){
 #!/usr/bin/env python3
 """The one HTTP client of cc-notifier: every script, on either end, sends through it.
 
-Protocol 6. The shared token (<dir>/token, the same value on the Mac and on each
-remote) is a key, and the key never travels:
+Keys (protocol 7). The Mac's listener keeps one key per machine that may send to
+it (keys/<name> there; `cc_token.sh push <host>` on the Mac issues one). Each
+machine keeps its own key in <dir>/token and its name in <dir>/key-name. A key is
+never sent anywhere:
 
-  * Every request carries X-CC-Time, X-CC-Nonce and X-CC-Sig: an HMAC-SHA256,
-    under the token, of the method, path, query, a hash of the body, the time and
-    the nonce. The listener takes a request once, and only within WINDOW seconds
-    of its time, so a copy of one can be neither changed nor sent again.
-  * Before anything goes out, /ping?c=<challenge> has to answer with
-    proof=HMAC(token, challenge), which only a listener holding the token can
-    give. On a shared login node a dropped tunnel leaves the port free, and any
-    user there can listen on it; such a listener gets nothing from us.
+  * Every request carries X-CC-Key (the key's name), X-CC-Time, X-CC-Nonce and
+    X-CC-Sig: an HMAC-SHA256, under the key, of the name, the method, path and
+    query, a hash of the body, the time and the nonce. The listener takes a
+    request once, and only within WINDOW seconds of its time, so a copy of one can
+    be neither changed nor sent again, nor passed off as another machine's.
+  * Before anything goes out, /ping?c=<challenge>&k=<name> has to answer with
+    proof=HMAC(key, name, challenge), which only a listener holding this
+    machine's key can give. On a shared login node a dropped tunnel leaves the
+    port free, and any user there can listen on it; such a listener gets nothing.
   * Nothing secret, and no message text, goes on a command line: any user of a
     shared host can list those. The fields come in the environment, which only
     the same user can read.
 
-Moving from protocol 5. A listener of protocol 5 (the version before this one)
-takes the token itself, in a header. A machine upgraded from that version keeps
-<dir>/legacy-token.sha256, the hash of the token it had then; while that file
-names the current token, and for LEGACY_HOURS after it was written, this client
-still serves a protocol-5 listener that way (in a header, never on a command
-line). The first time a protocol-6 listener proves itself the file is deleted,
-and from then on the token never leaves this machine. A new token never matches
-the file, so a new token never travels.
+Older forms, while machines move to keys of their own:
+  * Without <dir>/key-name the token is the key all machines shared (protocol 6):
+    the request names no key and its signature covers no name. A protocol-7
+    listener takes that form only while it keeps the shared key (keys/shared);
+    `cc_token.sh push` and `rotate` retire it once each machine has its own.
+  * Protocol 5 sent the token itself, in a header. A machine upgraded from that
+    version keeps <dir>/legacy-token.sha256, the hash of the token it had then;
+    while that file names the current token, and for LEGACY_HOURS after it was
+    written, this client still serves a protocol-5 listener that way (in a
+    header, never on a command line). The first time a newer listener proves
+    itself the file is deleted. A new token never matches it.
 
 usage:
   cc_client.py send <alarm|done|ask|beep|stop>
       fields from the environment: CC_F_LABEL, CC_F_AGENT, CC_F_SESSION,
       CC_F_TITLE, CC_F_BRIEF, and the text for the phone push in the file
       CC_F_BODY_FILE (or in CC_F_BODY). `stop` without CC_F_SESSION silences
-      every alarm. Prints "http=<code> err=<reason> auth=<signed|legacy|->";
+      every alarm. Prints "http=<code> err=<reason> auth=<signed|shared|legacy|->";
       exit 0 when the listener answered 200.
-  cc_client.py ping       prints what the listener says; exit 0 when it proved itself
-  cc_client.py challenge  prints a fresh challenge (cc_tunnel_keep.sh on the Mac)
-  cc_client.py verify <challenge>
-      reads a /ping answer on stdin; exit 0 when its proof is right for <challenge>
+  cc_client.py ping       "proto=<n> verified=<yes|no> as=<key name|shared> why=<reason>";
+                          exit 0 when the listener proved it holds this machine's key
+  cc_client.py challenge [name]
+                          a fresh query for /ping (c=...&k=<name, default this machine's>),
+                          for cc_tunnel_keep.sh
+  cc_client.py verify <query>
+                          reads a /ping answer on stdin; exit 0 when its proof is right
+                          (on the Mac, for a host's name, with that host's key in keys/)
+  cc_client.py version    the protocol this client speaks
 Environment: CC_NOTIFIER_DIR (default ~/.cc-notifier), CC_NOTIFY_PORT (28765),
 CC_NOTIFY_TIMEOUT (seconds per request, default 5; a ping waits at most 2). Each
 call has an overall limit too, so a listener that answers slowly cannot hold it.
@@ -112,9 +151,9 @@ import signal
 import socket
 import sys
 import time
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qs, quote, urlencode
 
-PROTO = 6
+PROTO = 7
 PORT = int(os.environ.get("CC_NOTIFY_PORT") or "28765")
 DIR = os.environ.get("CC_NOTIFIER_DIR") or os.path.join(os.path.expanduser("~"), ".cc-notifier")
 LEGACY = "legacy-token.sha256"
@@ -124,18 +163,32 @@ ACTS = ("alarm", "done", "ask", "beep", "stop")
 FIELDS = (("label", "CC_F_LABEL"), ("agent", "CC_F_AGENT"), ("session", "CC_F_SESSION"),
           ("title", "CC_F_TITLE"), ("brief", "CC_F_BRIEF"))
 CHALLENGE = re.compile(r"[0-9a-f]{32}\Z")
+NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+KEYLIKE = re.compile(r"[0-9a-f]{24,}\Z")
 
 
-# --- the protocol (cc_alarm_listener.py holds the same three functions) ------
+def valid_name(name):
+    """A machine's key name (cc_alarm_listener.py holds the same rule): lowercase,
+    not one the kit uses for its own files, not the shared key's ("shared")."""
+    return bool(NAME.match(name)) and name != "shared" and ".." not in name and not KEYLIKE.match(name) \
+        and not re.search(r"\.(new|tmp|bak|port)\Z|\.tmp\.", name)
 
-def request_sig(key, method, path, query, body, t, nonce):
-    msg = "cc-notifier/6 req\n%s\n%s\n%s\n%s\n%d\n%s" % (
-        method, path, query, hashlib.sha256(body).hexdigest(), t, nonce)
+
+# --- the protocol (cc_alarm_listener.py holds the same functions) ------------
+
+def request_sig(key, method, path, query, body, t, nonce, name=""):
+    """Protocol 7 when the request names its key, protocol 6 (the shared key) when not."""
+    digest = hashlib.sha256(body).hexdigest()
+    if name:
+        msg = "cc-notifier/7 req\n%s\n%s\n%s\n%s\n%s\n%d\n%s" % (name, method, path, query, digest, t, nonce)
+    else:
+        msg = "cc-notifier/6 req\n%s\n%s\n%s\n%s\n%d\n%s" % (method, path, query, digest, t, nonce)
     return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def ping_proof(key, challenge):
-    return hmac.new(key, ("cc-notifier/6 pong\n" + challenge).encode("utf-8"), hashlib.sha256).hexdigest()
+def ping_proof(key, challenge, name=""):
+    msg = ("cc-notifier/7 pong\n%s\n%s" % (name, challenge)) if name else ("cc-notifier/6 pong\n" + challenge)
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def same(a, b):
@@ -146,12 +199,29 @@ def same(a, b):
 # --- this machine's side -----------------------------------------------------
 
 def token_key():
-    """The shared token as bytes, b"" when there is none."""
+    """This machine's key as bytes, b"" when there is none."""
     try:
         with open(os.path.join(DIR, "token"), "rb") as f:
             return f.read().strip()
     except OSError:
         return b""
+
+
+def key_name():
+    """This machine's key name at the listener: "" when it has none (it holds the
+    shared key of protocol 6), None when <dir>/key-name cannot be used."""
+    try:
+        with open(os.path.join(DIR, "key-name")) as f:
+            name = f.read().strip()
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return None
+    # A name goes out with every ping: one that looks like a key (cc_token.sh set
+    # <key> by mistake) is never used.
+    if not valid_name(name) or KEYLIKE.match(name) or same(name, token_key().decode("utf-8", "replace")):
+        return None
+    return name
 
 
 def legacy_until():
@@ -182,7 +252,7 @@ def drop_legacy():
 
 
 def parse_ping(text):
-    """'ok proto=6 proof=...' -> {'proto': 6, 'proof': '...', ...}"""
+    """'ok proto=7 proof=...' -> {'proto': 7, 'proof': '...', ...}"""
     out = {}
     for word in (text or "").split():
         name, sep, value = word.partition("=")
@@ -191,6 +261,16 @@ def parse_ping(text):
     m = re.match(r"[0-9]{1,4}", out.get("proto", ""))
     out["proto"] = int(m.group(0)) if m else 0
     return out
+
+
+def ping_query(challenge, name):
+    return "c=" + challenge + ("&k=" + name if name else "")
+
+
+def proves(info, key, challenge, name):
+    """Does a /ping answer prove the listener holds this key (under this name)?"""
+    return bool(key) and name is not None and info["proto"] >= (7 if name else 6) \
+        and same(info.get("proof", ""), ping_proof(key, challenge, name))
 
 
 def addresses():
@@ -220,19 +300,19 @@ def ping(timeout=2.0):
     """Ask each loopback address for a proof. -> dict (proto, verified, addr, ...)
     for the first listener that proves itself, else for the first one that
     answered at all; None when nothing answers."""
-    key = token_key()
+    key, name = token_key(), key_name()
     first = None
     for addr in addresses():
         challenge = secrets.token_hex(16)
         try:
-            status, text = exchange(addr, "GET", "/ping?c=" + challenge, timeout=timeout)
+            status, text = exchange(addr, "GET", "/ping?" + ping_query(challenge, name or ""), timeout=timeout)
         except (OSError, http.client.HTTPException):
             continue
         if status != 200:
             continue
         info = parse_ping(text)
         info["addr"] = addr
-        info["verified"] = bool(key) and info["proto"] >= PROTO and same(info.get("proof", ""), ping_proof(key, challenge))
+        info["verified"] = proves(info, key, challenge, name)
         if info["verified"]:
             return info
         if first is None:
@@ -240,42 +320,60 @@ def ping(timeout=2.0):
     return first
 
 
+def decide(info, key, name):
+    """-> (how to send: "signed", "shared", "legacy", or None when not at all; the reason)"""
+    if not key:
+        return None, "no_token"
+    if name is None:
+        return None, "bad_key_name"
+    if info is None:
+        return None, "unreachable"
+    if info["verified"]:
+        return ("signed" if name else "shared"), "ok"
+    if not name and info["proto"] == 5 and legacy_allowed(key):
+        return "legacy", "ok"
+    if info.get("key") == "unknown":
+        return None, "key_unknown_at_listener"      # never issued there, or revoked
+    if info.get("shared") == "none":
+        return None, "no_key_for_this_machine"      # the shared key is retired; this machine has none of its own
+    if info.get("auth") == "none":
+        return None, "listener_has_no_token"        # a protocol-6 listener without a token
+    if name and info["proto"] == 6:
+        return None, "old_listener_proto6"          # a key of its own needs protocol 7 at the Mac
+    if info["proto"] >= 6:
+        # It answers like a listener but cannot prove it holds our key: the two
+        # ends have different keys, or someone else holds the port here.
+        return None, "unverified"
+    return None, "old_listener_proto%d" % info["proto"]
+
+
 def send(act, fields, body=b"", timeout=5.0):
     """-> (HTTP status or 0, reason, how it was authenticated)"""
-    key = token_key()
-    if not key:
-        return 0, "no_token", "-"
-    info = ping(min(timeout, 2.0))
-    if info is None:
-        return 0, "unreachable", "-"
+    key, name = token_key(), key_name()
+    info = ping(min(timeout, 2.0)) if key and name is not None else None
+    how, why = decide(info, key, name)
+    if how is None:
+        return 0, why, "-"
     path = "/" + act
-    query = urlencode([(name, value) for name, value in fields if value], quote_via=quote)
+    query = urlencode([(n, v) for n, v in fields if v], quote_via=quote)
     headers = {"Content-Type": "text/plain; charset=utf-8"}
-    if info["verified"]:
+    if how == "legacy":
+        headers["X-CC-Token"] = key.decode("utf-8", "replace")
+    else:
         drop_legacy()
         t, nonce = int(time.time()), secrets.token_hex(16)
         headers.update({"X-CC-Time": str(t), "X-CC-Nonce": nonce,
-                        "X-CC-Sig": request_sig(key, "POST", path, query, body, t, nonce)})
-        auth = "signed"
-    elif info["proto"] == 5 and legacy_allowed(key):
-        headers["X-CC-Token"] = key.decode("utf-8", "replace")
-        auth = "legacy"
-    elif info["proto"] >= PROTO and info.get("auth") == "none":
-        return 0, "listener_has_no_token", "-"
-    elif info["proto"] >= PROTO:
-        # It answers like a listener but cannot prove it holds our token: the two
-        # ends have different tokens, or someone else holds the port here.
-        return 0, "unverified", "-"
-    else:
-        return 0, "old_listener_proto%d" % info["proto"], "-"
+                        "X-CC-Sig": request_sig(key, "POST", path, query, body, t, nonce, name)})
+        if name:
+            headers["X-CC-Key"] = name
     try:
         status, _ = exchange(info["addr"], "POST", path + ("?" + query if query else ""),
                              body=body, headers=headers, timeout=timeout)
     except socket.timeout:
-        return 0, "timeout", auth
+        return 0, "timeout", how
     except (OSError, http.client.HTTPException):
-        return 0, "unreachable", auth
-    return status, "ok" if status == 200 else "http_%d" % status, auth
+        return 0, "unreachable", how
+    return status, "ok" if status == 200 else "http_%d" % status, how
 
 
 class OutOfTime(Exception):
@@ -318,35 +416,46 @@ def run(cmd, argv, timeout):
         elif os.environ.get("CC_F_BODY"):
             body = os.environ["CC_F_BODY"].encode("utf-8", "replace")[:MAX_POST]
         fields = [(name, os.environ.get(var, "")) for name, var in FIELDS]
-        status, why, auth = send(argv[2], fields, body, timeout)
-        print("http=%03d err=%s auth=%s" % (status, why, auth))
+        status, why, how = send(argv[2], fields, body, timeout)
+        print("http=%03d err=%s auth=%s" % (status, why, how))
         return 0 if status == 200 else 1
     if cmd == "ping" and len(argv) == 2:
-        info = ping(min(timeout, 2.0))
-        if info is None:
+        key, name = token_key(), key_name()
+        info = ping(min(timeout, 2.0)) if key and name is not None else None
+        how, why = decide(info, key, name)
+        if info is None and why == "unreachable":
             print("unreachable")
             return 1
-        notes = ""
-        if not info["verified"]:
-            if not token_key():
-                notes = " token=none"
-            elif info["proto"] == 5 and legacy_allowed(token_key()):
-                notes = " legacy=yes until=" + time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(legacy_until()))
-            elif info["proto"] == 5 and legacy_until():
-                notes = " legacy=expired"
-        if info.get("auth"):
-            notes += " listener_auth=" + info["auth"]
-        print("proto=%d verified=%s%s" % (info["proto"], "yes" if info["verified"] else "no", notes))
-        return 0 if info["verified"] else 1
-    if cmd == "challenge" and len(argv) == 2:
-        print(secrets.token_hex(16))
+        line = "proto=%d verified=%s as=%s why=%s" % (
+            info["proto"] if info else 0, "yes" if info and info["verified"] else "no",
+            name if name else ("shared" if name == "" else "?"), why)
+        if how == "legacy":
+            line += " legacy=yes until=" + time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(legacy_until()))
+        print(line)
+        return 0 if info and info["verified"] else 1
+    if cmd == "challenge" and len(argv) in (2, 3):
+        name = argv[2] if len(argv) == 3 else (key_name() or "")
+        if name and not valid_name(name):
+            return 2
+        print(ping_query(secrets.token_hex(16), name))
         return 0
     if cmd == "verify" and len(argv) == 3:
-        key, challenge = token_key(), argv[2]
+        q = parse_qs(argv[2])
+        challenge, name = q.get("c", [""])[0], q.get("k", [""])[0]
         info = parse_ping(sys.stdin.read(4096))
-        ok = bool(key) and bool(CHALLENGE.match(challenge)) and info["proto"] >= PROTO \
-            and same(info.get("proof", ""), ping_proof(key, challenge))
+        if name and name != key_name() and valid_name(name):
+            try:                                   # on the Mac: a host's key, to check that host's tunnel
+                with open(os.path.join(DIR, "keys", name), "rb") as f:
+                    key = f.read().strip()
+            except OSError:
+                key = b""
+        else:
+            key = token_key() if name == (key_name() or "") else b""
+        ok = bool(CHALLENGE.match(challenge)) and proves(info, key, challenge, name)
         return 0 if ok else 1
+    if cmd == "version" and len(argv) == 2:
+        print(PROTO)
+        return 0
     sys.stderr.write(__doc__[__doc__.index("usage:"):])
     return 2
 
@@ -447,6 +556,7 @@ hc(){ curl -s --noproxy '*' --max-time 4 -o /dev/null -w '%{http_code}' "$@" 2>/
 # Asks the listener to prove it holds this machine's token; sends nothing else and
 # rings nothing. The token never travels and never appears on a command line.
 ping_out="$(CC_NOTIFY_PORT="$PORT" CC_NOTIFIER_DIR="$DIR" "$PYBIN" "$HERE/cc_client.py" ping 2>/dev/null)"
+if [ -f "$DIR/cc_alarm_listener.py" ]; then FIX="on this Mac: cc_token.sh new"; else FIX="on the Mac: cc_token.sh push <this host>"; fi
 
 printf "cc-notifier doctor — %s (%s)\n" "$(uname -n)" "$OS"
 
@@ -461,12 +571,14 @@ fi
 # --- listener version + auth (signed requests; the listener proves it holds the token) ---
 if [ "$code" = 200 ]; then
   case "$ping_out" in
-    proto=*\ verified=yes*) ok "listener is current and holds this machine's token (${ping_out%% *}): requests are signed, the token never travels";;
+    proto=*\ verified=yes\ as=shared*) warn "listener holds the key all machines share (${ping_out%% *}); requests are signed, but give this machine its own key — on the Mac: cc_token.sh push <this host>";;
+    proto=*\ verified=yes*) ok "listener is current and holds this machine's own key (${ping_out%% why=*}): requests are signed, the key never travels";;
     *legacy=yes*) warn "listener is protocol 5: it still gets the old token in a header — re-run install.sh on the Mac, then there: cc_token.sh rotate <this host>";;
-    *token=none*) bad "no token on this machine ($DIR/token): nothing is sent — on the Mac: cc_token.sh push <this host>";;
-    *listener_auth=none*) bad "the listener has no token, so it refuses everything — on the Mac: cc_token.sh new, then cc_token.sh push <each remote>";;
-    proto=[0-5]\ *) bad "listener is older than these hooks (${ping_out%% *}, need 6: signed requests), so nothing is sent to it — re-run install.sh on the Mac";;
-    *) bad "the listener cannot prove it holds this machine's token (${ping_out:-no answer}): the tokens differ (on the Mac: cc_token.sh push <this host>) or someone else holds port ${PORT} here — nothing is sent to it";;
+    *why=no_token*|*why=bad_key_name*) bad "no usable key on this machine ($DIR/token, $DIR/key-name): nothing is sent — $FIX";;
+    *why=key_unknown_at_listener*|*why=no_key_for_this_machine*) bad "the listener takes no key from this machine on this port (${ping_out##*why=}; or someone else holds port ${PORT} here): nothing is sent — $FIX";;
+    *why=listener_has_no_token*) bad "the listener has no token, so it refuses everything — re-run install.sh on the Mac";;
+    *why=old_listener*) bad "listener is older than these hooks (${ping_out%% *}), so nothing is sent to it — re-run install.sh on the Mac";;
+    *) bad "the listener cannot prove it holds this machine's key (${ping_out:-no answer}): the keys differ (on the Mac: cc_token.sh push <this host>) or someone else holds port ${PORT} here — nothing is sent to it";;
   esac
 fi
 [ "$("$PYBIN" "$DIR/cc_hook.py" check 2>/dev/null)" = "ok" ] && ok "hook helper runs ($PYBIN cc_hook.py)" \
@@ -474,8 +586,14 @@ fi
 n="$(find "$DIR/sessions" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
 note "per-session state: ${n} session(s) in $DIR/sessions; decisions are logged in $DIR/hook.log"
 
-# --- private files: the token, the config (Telegram bot token), the message texts ---
-for f in "$DIR" "$DIR/token" "$DIR/config" "$DIR/sessions" "$DIR/tmp"; do
+# --- keys the listener takes (Mac) ---
+if [ -d "$DIR/keys" ]; then
+  note "keys the listener takes (cc_token.sh keys): $("$DIR/cc_token.sh" keys 2>/dev/null | awk '{printf "%s=%s ", $1, $3}')"
+  [ -e "$DIR/keys/shared" ] && warn "the key all machines shared before is still taken on port ${PORT} — give each remote its own (cc_token.sh push <host>...), then: cc_token.sh revoke shared"
+fi
+
+# --- private files: the keys, the config (Telegram bot token), the message texts ---
+for f in "$DIR" "$DIR/token" "$DIR/key-name" "$DIR/keys" "$DIR"/keys/* "$DIR/ports" "$DIR/config" "$DIR/sessions" "$DIR/tmp" "$DIR/listener.log" "$DIR/tunnel.log"; do
   [ -e "$f" ] || continue
   m="$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null)"
   case "$m" in 700|600|500|400) ;; *) bad "$f is readable by others (mode $m) — chmod go= $f";; esac
@@ -1253,9 +1371,10 @@ case "$res" in
 esac
 printf 'FAIL /%s -> %s\n' "$act" "$res" >&2
 case "$res" in
-  *err=no_token*) printf 'No token in %s: on the Mac, run  ~/.cc-notifier/cc_token.sh push <this host>\n' "$DIR" >&2;;
+  *err=no_token*|*err=key_unknown_at_listener*|*err=no_key_for_this_machine*|*err=bad_key_name*)
+    printf 'This machine has no key the listener takes (%s; or someone else holds port %s here): on the Mac, run  ~/.cc-notifier/cc_token.sh push <this host>  (on the Mac itself: cc_token.sh new)\n' "${res#* err=}" "$PORT" >&2;;
   *err=unverified*|*http=401*|*http=403*)
-    printf 'The listener did not take our signature: the two ends have different tokens (on the Mac: cc_token.sh push <this host>), or someone else holds port %s here.\n' "$PORT" >&2;;
+    printf 'The listener did not take our signature: the two ends have different keys (on the Mac: cc_token.sh push <this host>), or someone else holds port %s here.\n' "$PORT" >&2;;
   *err=old_listener*) printf 'The listener on the Mac is older than these hooks: re-run install.sh on the Mac.\n' >&2;;
   *) printf 'Check the listener/tunnel with %s/cc_tunnel_test.sh ping.\n' "$DIR" >&2;;
 esac
@@ -1263,95 +1382,201 @@ exit 1
 CCN_EOF_cc_notify_sh
   cat > "$DIR/cc_token.sh" <<'CCN_EOF_cc_token_sh'
 #!/bin/bash
-# Manage the shared token. The SAME value must be in <dir>/token on the Mac
-# (receiver) and on each remote (sender). It is a key: every request is signed
-# with it and it never travels (cc_client.py). Without it nothing is sent, and a
-# listener without it refuses everything.
+# Manage the keys (protocol 7). The Mac's listener keeps one key per machine that
+# may send to it (<dir>/keys/<name>) and, for each remote, the port its tunnel ends
+# at (<dir>/ports/<name>); each machine keeps its own key in <dir>/token and its
+# name in <dir>/key-name. Every request is signed with the key, which is never sent
+# anywhere (cc_client.py). A key's name is the ssh alias it was issued to.
 #
-# Nothing here puts the token on a command line, where any user of a shared host
-# could read it (or your shell history keep it): it moves over ssh, on standard input.
+# Nothing here puts a key on a command line, where any user of a shared host could
+# read it (or your shell history keep it): keys move over ssh, on standard input.
 #
-#   cc_token.sh new               a new random token here (then `push` it to the other ends)
-#   cc_token.sh push <host>...    copy this machine's token to each ssh host
-#   cc_token.sh rotate <host>...  on the Mac: a new token, copied to each host, then used here
-#   cc_token.sh set               read a token from standard input (cc_token.sh set < file)
-#   cc_token.sh show              print the token
-#   cc_token.sh off               remove the token: nothing is sent, and a listener here refuses everything
+# On the Mac:
+#   cc_token.sh push <host>...    give each ssh host its own key and port (made if it has none), send the key there
+#   cc_token.sh rotate <host>...  a new key for each host; other machines are not touched
+#   cc_token.sh revoke <host>...  forget a host's key: it can no longer send ("revoke shared": the shared key)
+#   cc_token.sh keys              the machines that have a key, with their ports
+#   cc_token.sh new               a new key for this Mac's own senders (the stop hotkey, local sessions)
+# On a remote:
+#   cc_token.sh set <name>        this machine's key, read from standard input, under <name>
+#   cc_token.sh off               remove this machine's key: it sends nothing
+# Anywhere:
+#   cc_token.sh show              this machine's key name and key
+# Names are lowercase ssh aliases (letters, digits, . _ -).
 DIR="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"
-F="$DIR/token"
+F="$DIR/token"; N="$DIR/key-name"; KEYS="$DIR/keys"; PORTS="$DIR/ports"
+PORT="${CC_NOTIFY_PORT:-28765}"            # this Mac's own port; each remote gets one after it
+RPORT="${CC_REMOTE_PORT:-28765}"           # the port the hooks use on a remote (the far end of its tunnel)
+TUNNEL_PORTS="${CC_TUNNEL_PORTS:-$(seq $((PORT + 1)) $((PORT + 16)))}"   # the listener binds these, one per remote
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PYBIN="$(command -v python3 || echo /usr/bin/python3)"
 umask 077
+export LC_ALL=C                            # character sets below mean ASCII, whatever the locale
 mkdir -p "$DIR" && chmod 700 "$DIR" 2>/dev/null
 
-# Run on the far end by ssh; its kit is in its own CC_NOTIFIER_DIR or ~/.cc-notifier.
-REMOTE_PUT='umask 077; d="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"; mkdir -p "$d" && cat > "$d/token.tmp" && test -s "$d/token.tmp" && mv -f "$d/token.tmp" "$d/token"'
-REMOTE_HAS_CLIENT='test -f "${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}/cc_client.py"'
-REMOTE_PING='python3 "${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}/cc_client.py" ping'
+# Run on the far end by ssh, through sh whatever the login shell there (no single
+# quotes inside); its kit is in its own CC_NOTIFIER_DIR or ~/.cc-notifier.
+KIT='d="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"'
+remote(){ _rh="$1"; shift; ssh "$_rh" "sh -c '$KIT; $*'"; }
+REMOTE_SWITCH='test -s "$d/token.new" && test -s "$d/key-name.new" && mv -f "$d/token.new" "$d/token" && mv -f "$d/key-name.new" "$d/key-name"'
+REMOTE_UNSTAGE='rm -f "$d/token.new" "$d/key-name.new"'
+REMOTE_VERSION='python3 "$d/cc_client.py" version 2>/dev/null'
+REMOTE_PING='python3 "$d/cc_client.py" ping'
+REMOTE_NAME='cat "$d/key-name" 2>/dev/null'
 
-usage(){ sed -n '9,15s/^# \{0,1\}//p' "$0" >&2; exit 2; }
-new_token(){ head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }        # 64 hex characters
+usage(){ sed -n '11,22s/^# \{0,1\}//p' "$0" >&2; exit 2; }
+say(){ echo "$*" >&2; }
+new_key(){ head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }        # 64 hex characters
 put(){  # put <file>: standard input becomes <file>, private, all at once
   cat > "$1.tmp.$$" && [ -s "$1.tmp.$$" ] && chmod 600 "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1" \
     || { rm -f "$1.tmp.$$"; return 1; }
 }
-push_one(){ ssh "$1" "$REMOTE_PUT" < "$2"; }    # push_one <host> <file>
-local_ok(){  # does the listener here take signed requests made with this token?
+name_ok(){  # a key name: lowercase letters, digits, . _ - (cc_client.valid_name holds the same rule)
+  case "$1" in ""|shared|local|*..*|*.new|*.tmp|*.bak|*.port|*.tmp.*) return 1;; [abcdefghijklmnopqrstuvwxyz0123456789]*) ;; *) return 1;; esac
+  case "$1" in *[!abcdefghijklmnopqrstuvwxyz0123456789._-]*) return 1;; esac
+  [ ${#1} -le 64 ] || return 1
+  case "$1" in *[!0123456789abcdef]*) return 0;; esac     # all hex digits: fine if short, refused if it looks like a key
+  [ ${#1} -lt 24 ]
+}
+is_mac(){ [ -f "$DIR/cc_alarm_listener.py" ]; }
+need_mac(){ is_mac || { say "keys are issued on the Mac (where the listener runs): run this there"; exit 2; }; }
+local_ok(){  # does the listener here prove it holds this Mac's own key (protocol 7)?
   case "$(CC_NOTIFIER_DIR="$DIR" "$PYBIN" "$HERE/cc_client.py" ping 2>/dev/null)" in
-    proto=*\ verified=yes*) return 0;; *) return 1;;
+    proto=*\ verified=yes\ as=local\ *) return 0;; *) return 1;;
   esac
+}
+remote_ready(){  # does <host> run a sender that can use a key of its own (protocol 7)?
+  v="$(remote "$1" "$REMOTE_VERSION" 2>/dev/null)"
+  case "$v" in [7-9]|[1-9][0-9]) return 0;; *) return 1;; esac
+}
+port_of(){  # port_of <host>: the Mac port its tunnel ends at, assigned now if it has none
+  [ -s "$PORTS/$1" ] && { cat "$PORTS/$1"; return 0; }
+  # One assignment at a time (mkdir is atomic): two runs must never hand out one port twice.
+  n=0; until mkdir "$PORTS/.lock" 2>/dev/null; do
+    n=$((n + 1)); [ "$n" -ge 50 ] && { say "  ports are locked ($PORTS/.lock): another cc_token.sh is running, or remove it"; return 1; }
+    sleep 0.1
+  done
+  rc=1
+  for p in $TUNNEL_PORTS; do
+    if ! grep -qx "$p" "$PORTS"/* 2>/dev/null; then echo "$p" | put "$PORTS/$1" && echo "$p" && rc=0; break; fi
+  done
+  rmdir "$PORTS/.lock"; return $rc
+}
+retarget(){  # point <host>'s live tunnel at <port> (through the ssh master; no new connection)
+  ssh -O check "$1" >/dev/null 2>&1 || return 1
+  ssh -O cancel -R "$RPORT:localhost:$PORT" "$1" >/dev/null 2>&1
+  ssh -O cancel -R "$RPORT:localhost:$2" "$1" >/dev/null 2>&1
+  ssh -O forward -R "$RPORT:localhost:$2" "$1" >/dev/null 2>&1
+}
+
+# give <host> <rotate:0|1>: stage the key there, then switch both ends, then its tunnel.
+give(){
+  h="$1"; k="$KEYS/$h"
+  other="$(remote "$h" "$REMOTE_NAME" 2>/dev/null)"
+  if name_ok "$other" && [ "$other" != "$h" ] && [ -e "$KEYS/$other" ]; then
+    say "  $h: its kit already holds the key of $other (the same home, under two names?); not touching it. Use one name for both."
+    return 1
+  fi
+  p="$(port_of "$h")" || { say "  $h: no free port left for it (the listener has $(echo $TUNNEL_PORTS | wc -w | tr -d ' '))"; return 1; }
+  if [ "$2" = 1 ] || [ ! -s "$k" ]; then
+    new_key | put "$k.new" || { say "  $h: could not write its new key here; nothing changed for $h"; return 1; }
+    src="$k.new"
+  else src="$k"; fi
+  if ! ssh "$h" "sh -c '$KIT; umask 077; mkdir -p \"\$d\" && cat > \"\$d/token.new\" && test -s \"\$d/token.new\" && echo $h > \"\$d/key-name.new\"'" < "$src"; then
+    remote "$h" "$REMOTE_UNSTAGE" >/dev/null 2>&1; rm -f "$k.new"
+    say "  $h: could not send it the key; nothing changed for $h"; return 1
+  fi
+  [ "$src" = "$k.new" ] && mv -f "$k.new" "$k"               # from here the listener expects the new key from $h
+  if ! remote "$h" "$REMOTE_SWITCH"; then
+    say "  $h: the key was sent but $h did not switch to it, so $h cannot send now: run $0 push $h again"; return 1
+  fi
+  if retarget "$h" "$p"; then moved="its tunnel now ends at port $p"
+  else moved="no ssh master for $h right now: its tunnel moves to port $p when you reconnect"; fi
+  say "  $h: has its own key; $moved. Keep this under 'Host $h' in ~/.ssh/config (in place of any other RemoteForward $RPORT):"
+  say "        RemoteForward $RPORT localhost:$p"
+  r="$(remote "$h" "$REMOTE_PING" 2>/dev/null)"
+  case "$r" in
+    proto=*\ verified=yes\ as="$h"\ *) say "  $h: the listener proves itself to it";;
+    *) say "  $h: could not check the listener from there yet (${r:-no answer}): is its tunnel up, and does it end at port $p?";;
+  esac
+  return 0
 }
 
 case "${1:-show}" in
-  new)
-    new_token | put "$F" || { echo "could not write $F" >&2; exit 1; }
-    echo "new token in $F. The other ends need it too: $0 push <host>..." >&2 ;;
-  push)
-    shift; [ $# -ge 1 ] || usage
-    [ -s "$F" ] || { echo "no token here ($F): make one with '$0 new'" >&2; exit 1; }
+  push|rotate)
+    need_mac; what="$1"; shift; [ $# -ge 1 ] || usage
+    for h in "$@"; do name_ok "$h" || { say "not a usable name: '$h' (a lowercase ssh alias: letters, digits, . _ -)"; exit 2; }; done
+    mkdir -p "$KEYS" "$PORTS" && chmod 700 "$KEYS" "$PORTS"
+    local_ok || { say "refusing: the listener here does not take keys of their own yet (protocol 7), or this Mac's own key is broken. Re-run install.sh on this Mac first."; exit 1; }
     for h in "$@"; do
-      if push_one "$h" "$F"; then echo "token copied to $h" >&2
-      else echo "could not copy the token to $h" >&2; exit 1; fi
-    done ;;
-  rotate)
-    shift; [ $# -ge 1 ] || usage
-    # A protocol-5 listener here could not check the new token's signatures,
-    # and an old sender on a host would send the new token itself, in the clear.
-    local_ok || { echo "refusing: the listener here does not take signed requests yet. Re-run install.sh on this Mac first." >&2; exit 1; }
-    for h in "$@"; do
-      ssh "$h" "$REMOTE_HAS_CLIENT" || {
-        echo "refusing: $h has no protocol-6 sender (cc_client.py), which would send the new token in the clear. Update cc-notifier there first." >&2; exit 1; }
+      remote_ready "$h" || { say "refusing: $h has no sender that can use a key of its own (protocol 7), or ssh to it failed. Update cc-notifier there first."; exit 1; }
     done
-    new_token | put "$F.new" || { echo "could not write $F.new" >&2; exit 1; }
+    failed=0
+    for h in "$@"; do give "$h" "$([ "$what" = rotate ] && echo 1 || echo 0)" || failed=1; done
+    if [ -e "$KEYS/shared" ]; then
+      say "The shared key is still taken on port $PORT, for machines without a key of their own."
+      say "Once every remote has its own: $0 revoke shared"
+    fi
+    [ "$failed" = 0 ] || exit 1 ;;
+  revoke)
+    need_mac; shift; [ $# -ge 1 ] || usage
     for h in "$@"; do
-      push_one "$h" "$F.new" || {
-        rm -f "$F.new"; echo "could not copy the new token to $h; this Mac keeps the old one, so run rotate again" >&2; exit 1; }
-    done
-    mv -f "$F.new" "$F"
-    echo "new token in use here and on: $*" >&2
-    for h in "$@"; do
-      r="$(ssh "$h" "$REMOTE_PING" 2>/dev/null)"
-      case "$r" in
-        proto=*\ verified=yes*) echo "  $h: the listener proves itself to it ($r)" >&2;;
-        *) echo "  $h: token copied, but $h could not verify the listener (${r:-no answer}): is its tunnel down?" >&2;;
+      case "$h" in
+        local) say "not revoking this Mac's own key (the stop hotkey uses it); to replace it: $0 new";;
+        shared) if [ -e "$KEYS/shared" ]; then rm -f "$KEYS/shared" && say "retired the shared key: a machine without a key of its own can no longer send"
+                else say "the shared key is already retired"; fi;;
+        *) if name_ok "$h" && [ -e "$KEYS/$h" ]; then
+             rm -f "$KEYS/$h" "$PORTS/$h" && say "revoked $h: its key is no longer taken"
+             [ -e "$KEYS/shared" ] && say "  (the shared key is still taken: if $h still has it, it can send with it until: $0 revoke shared)"
+           else say "no key for '$h'"; fi;;
       esac
     done ;;
+  keys)
+    need_mac
+    for k in "$KEYS"/*; do
+      [ -f "$k" ] || continue
+      case "$k" in *.new|*.tmp.*) continue;; esac
+      n="${k##*/}"
+      case "$n" in
+        shared) echo "shared   port $PORT (the key all machines shared before protocol 7: $0 revoke shared retires it)";;
+        local)  echo "local    port $PORT (this Mac's own senders)";;
+        *)      echo "$n   port $(cat "$PORTS/$n" 2>/dev/null || echo '?')";;
+      esac
+    done ;;
+  new)
+    need_mac; mkdir -p "$KEYS" && chmod 700 "$KEYS"
+    new_key | put "$KEYS/local.new" || { say "could not write a new key; nothing changed"; exit 1; }
+    mv -f "$KEYS/local.new" "$KEYS/local" || { rm -f "$KEYS/local.new"; say "could not write a new key; nothing changed"; exit 1; }
+    if cp "$KEYS/local" "$F.tmp.$$" && chmod 600 "$F.tmp.$$" && mv -f "$F.tmp.$$" "$F" && echo local | put "$N"; then
+      say "new key for this Mac's own senders ($KEYS/local)"
+    else
+      rm -f "$F.tmp.$$"; say "the listener has the new key, but this Mac's senders could not get it: run $0 new again"; exit 1
+    fi ;;
   set)
-    if [ $# -gt 1 ]; then
-      echo "refusing: a token given on the command line can be read by other users of this host, and stays in your shell history." >&2
-      echo "Pipe it in instead ($0 set < file), or run '$0 set' and paste it. Better: on the Mac, $0 push <this host>." >&2
+    if [ $# -gt 2 ]; then
+      say "refusing: a key given on the command line can be read by other users of this host, and stays in your shell history."
+      say "Pipe it in instead ($0 set <name> < file), or run '$0 set <name>' and paste it. Better: on the Mac, $0 push <this host>."
       exit 2
     fi
-    if [ -t 0 ]; then printf 'token (not shown): ' >&2; IFS= read -rs t; echo >&2; else IFS= read -r t; fi
+    name="${2:-}"
+    if ! name_ok "$name"; then
+      case "$name" in *[!0123456789abcdef]*|"") ;; *) [ ${#name} -ge 24 ] && say "refusing: '$0 set' takes this machine's NAME; that looks like a key (and it is now in your shell history: on the Mac, $0 rotate <this host>)"; exit 2;; esac
+      say "usage: $0 set <name> (the lowercase name the Mac knows this machine by), the key on standard input"; exit 2
+    fi
+    if [ -t 0 ]; then printf 'key (not shown): ' >&2; IFS= read -rs t; echo >&2; else IFS= read -r t; fi
     case "$t" in
-      ""|*[!A-Za-z0-9._~+/=-]*) echo "that does not look like a token (letters, digits and ._~+/=- only); nothing changed" >&2; exit 1;;
+      ""|*[!A-Za-z0-9._~+/=-]*) say "that does not look like a key (letters, digits and ._~+/=- only); nothing changed"; exit 1;;
     esac
-    [ ${#t} -ge 16 ] || { echo "too short for a token; nothing changed" >&2; exit 1; }
-    printf '%s' "$t" | put "$F" && echo "token set ($F)" >&2 ;;
+    [ ${#t} -ge 16 ] || { say "too short for a key; nothing changed"; exit 1; }
+    [ "$t" != "$name" ] || { say "the name and the key are the same; nothing changed"; exit 1; }
+    printf '%s' "$t" | put "$F" && echo "$name" | put "$N" && say "key set for $name ($F)" ;;
   show)
-    [ -s "$F" ] && { cat "$F"; echo; } || { echo "(no token: nothing is sent, and a listener here refuses everything)" >&2; exit 1; } ;;
+    [ -s "$F" ] || { say "(no key: this machine sends nothing)"; exit 1; }
+    echo "name: $(cat "$N" 2>/dev/null || echo 'shared (protocol 6)')"
+    echo "key:  $(cat "$F")" ;;
   off)
-    rm -f "$F"; echo "token removed: this machine sends nothing, and a listener here refuses everything" >&2 ;;
+    if is_mac; then say "not on the Mac: its senders and the stop hotkey need this key (to replace it: $0 new)"; exit 2; fi
+    rm -f "$F" "$N"; say "key removed: this machine sends nothing" ;;
   *) usage ;;
 esac
 CCN_EOF_cc_token_sh
@@ -1387,23 +1612,34 @@ and nothing is cut: a long message continues in further Telegram messages." \
     out="$("$PYBIN" "$HERE/cc_client.py" send "$ACT" 2>&1)"; ec=$?;;
   *) echo "usage: $0 [ping|beep|alarm|ask|stop]" >&2; exit 2;;
 esac
-if [ "$ec" = 0 ]; then echo "OK   /${ACT} -> ${out}"; exit 0; fi
-echo "FAIL /${ACT} -> ${out}"
+if [ "$ec" = 0 ]; then echo "OK   /${ACT} -> ${out}"; case "$out" in *as=shared*|*auth=shared*) ;; *) exit 0;; esac; else echo "FAIL /${ACT} -> ${out}"; fi
+if [ -f "$DIR/cc_alarm_listener.py" ]; then FIX="on this Mac: ~/.cc-notifier/cc_token.sh new"
+else FIX="on your Mac: ~/.cc-notifier/cc_token.sh push <ssh alias of this machine>"; fi
+OR="(or someone else holds port ${PORT} here, posing as the listener)"
+if [ "$ec" = 0 ]; then
+  echo "  (the listener proves itself, but this machine still uses the key all machines share: $FIX)"; exit 0
+fi
 case "$out" in
   unreachable*|*err=unreachable*|*err=timeout*)
     echo "  nothing answers on localhost:${PORT}. If this is a REMOTE machine, from your Mac: ssh -O cancel -R ${PORT}:localhost:${PORT} <host>; ssh -O forward -R ${PORT}:localhost:${PORT} <host>";;
-  *token=none*|*err=no_token*)
-    echo "  no token on this machine ($DIR/token). On your Mac: ~/.cc-notifier/cc_token.sh push <ssh alias of this machine>";;
-  *listener_auth=none*|*err=listener_has_no_token*)
-    echo "  the listener has no token, so it refuses everything. On your Mac: ~/.cc-notifier/cc_token.sh new, then cc_token.sh push <this machine>";;
+  *no_token*|*bad_key_name*)
+    echo "  no usable key on this machine ($DIR/token, $DIR/key-name). Fix, $FIX";;
+  *key_unknown_at_listener*)
+    echo "  the listener says it has no key under this machine's name on this machine's port (never issued, revoked, or the tunnel ends at the wrong port) $OR. Fix, $FIX";;
+  *no_key_for_this_machine*)
+    echo "  this machine has no key of its own, and the listener says it no longer takes the shared one $OR. Fix, $FIX";;
+  *listener_has_no_token*)
+    echo "  the listener says it has no token $OR: re-run install.sh on the Mac.";;
   *legacy=yes*)
     echo "  the Mac listener is protocol 5: notifications still work, with the old token in a header. Update the Mac (re-run install.sh there), then on the Mac: ~/.cc-notifier/cc_token.sh rotate <this machine>";;
-  *verified=no*|*err=unverified*|*http=401*|*http=403*)
-    echo "  something answers on localhost:${PORT} but cannot prove it holds this machine's token: the two ends have different tokens (on your Mac: cc_token.sh push <this machine>), or someone else holds the port on this host. Nothing is sent to it.";;
-  *err=old_listener*)
-    echo "  the listener is older than these hooks (it cannot check signed requests): re-run install.sh on the Mac.";;
+  *old_listener*)
+    echo "  the listener is older than these hooks: re-run install.sh on the Mac.";;
+  *http=429*)
+    echo "  the listener took the request but this machine has sent too many in a short time (a burst of 20, then one every 3 s)";;
+  *unverified*|*http=401*|*http=403*)
+    echo "  something answers on localhost:${PORT} but cannot prove it holds this machine's key: the two ends have different keys ($FIX), or someone else holds the port on this host. Nothing is sent to it.";;
 esac
-exit 1
+exit "$ec"
 CCN_EOF_cc_tunnel_test_sh
   cat > "$DIR/notify_ask.sh" <<'CCN_EOF_notify_ask_sh'
 #!/bin/bash
@@ -1521,20 +1757,35 @@ LOG="${CC_NOTIFY_LOG:-$DIR/hook.log}"
 
 PYBIN="$(command -v python3 || echo /usr/bin/python3)"
 res="$(CC_NOTIFY_PORT="$PORT" CC_NOTIFIER_DIR="$DIR" "$PYBIN" "$HERE/cc_client.py" ping 2>/dev/null)"
+if [ -f "$DIR/cc_alarm_listener.py" ]; then FIX="this Mac: ~/.cc-notifier/cc_token.sh new"     # the Mac's own senders
+else FIX="the Mac: ~/.cc-notifier/cc_token.sh push <ssh alias of this machine>"; fi
+OR="(or someone else holds port ${PORT} on this host, posing as the listener)"
+me="${res##*as=}"; me="${me%% *}"
 case "$res" in
+  proto=[0-6]\ verified=yes\ as=shared*)
+    pv="${res%% *}"
+    echo "NOTE: the cc-notifier listener on the Mac is protocol ${pv#proto=}; it works, but every machine still shares one key. Re-run the cc-notifier install.sh on the Mac, then give this machine a key of its own: on the Mac: ~/.cc-notifier/cc_token.sh push <ssh alias of this machine>.";;
+  proto=*\ verified=yes\ as=shared*)
+    echo "NOTE: this machine still uses the cc-notifier key all machines share; it works, but give it a key of its own: on the Mac: ~/.cc-notifier/cc_token.sh push <ssh alias of this machine>.";;
   proto=*\ verified=yes*) ;;
   ""|unreachable*)
-    echo "NOTE: CC round-end notifier is unreachable (nothing answers on localhost:${PORT}). If this is a REMOTE machine, restore the tunnel from your Mac: ssh -O cancel -R ${PORT}:localhost:${PORT} <host> 2>/dev/null; ssh -O forward -R ${PORT}:localhost:${PORT} <host>. Verify: $DIR/cc_tunnel_test.sh";;
-  *token=none*)
-    echo "NOTE: cc-notifier has no token on this machine ($DIR/token), so it sends nothing. On the Mac: ~/.cc-notifier/cc_token.sh push <ssh alias of this machine>.";;
+    echo "NOTE: CC round-end notifier is unreachable (nothing answers on localhost:${PORT}). If this is a REMOTE machine, restore the tunnel from your Mac: ssh -O cancel -R ${PORT}:localhost:<its port> <host> 2>/dev/null; ssh -O forward -R ${PORT}:localhost:<its port> <host> (cc_token.sh keys on the Mac lists the ports). Verify: $DIR/cc_tunnel_test.sh";;
+  *why=no_token*)
+    echo "NOTE: cc-notifier has no key on this machine ($DIR/token), so it sends nothing. Fix, on $FIX.";;
+  *why=bad_key_name*)
+    echo "NOTE: cc-notifier cannot use $DIR/key-name (missing, malformed, or it looks like a key), so it sends nothing. Fix, on $FIX.";;
   *legacy=yes*)
     echo "NOTE: the cc-notifier listener on the Mac is protocol 5. Notifications still work, but this machine sends it the token itself (in a header) until the Mac is updated: re-run the cc-notifier install.sh on the Mac, then on the Mac: ~/.cc-notifier/cc_token.sh rotate <ssh alias of this machine>.";;
-  *listener_auth=none*)
-    echo "NOTE: the cc-notifier listener on the Mac has no token, so it refuses every notification. On the Mac: ~/.cc-notifier/cc_token.sh new, then cc_token.sh push <ssh alias of this machine>.";;
-  proto=[0-5]\ *)
-    echo "NOTE: the cc-notifier listener on the Mac is older than the hooks on this machine (${res%% *}, need protocol 6, signed requests), so nothing is sent to it. Fix: re-run the cc-notifier install.sh on the Mac. (If the Mac is current, something else answers on localhost:${PORT} here.)";;
+  *why=key_unknown_at_listener*)
+    echo "NOTE: the cc-notifier listener says it has no key named ${me} on this machine's port (never issued, revoked, or the tunnel ends at the wrong port) $OR, so nothing is sent. Fix, on $FIX.";;
+  *why=no_key_for_this_machine*)
+    echo "NOTE: this machine has no cc-notifier key of its own, and the listener says it no longer takes the shared one $OR, so nothing is sent. Fix, on $FIX.";;
+  *why=listener_has_no_token*)
+    echo "NOTE: the cc-notifier listener says it has no token $OR, so nothing is sent. Re-run the cc-notifier install.sh on the Mac.";;
+  *why=old_listener*)
+    echo "NOTE: the cc-notifier listener on the Mac is older than the hooks on this machine (${res%% *}) $OR, so nothing is sent to it. Fix: re-run the cc-notifier install.sh on the Mac.";;
   *)
-    echo "NOTE: something answers on localhost:${PORT} but cannot prove it holds this machine's cc-notifier token, so nothing is sent to it. Either the two ends have different tokens (on the Mac: ~/.cc-notifier/cc_token.sh push <ssh alias of this machine>) or someone else holds that port on this host (then restore the tunnel from the Mac). Check: $DIR/cc_tunnel_test.sh";;
+    echo "NOTE: something answers on localhost:${PORT} but cannot prove it holds this machine's cc-notifier key, so nothing is sent to it. Either the two ends have different keys (fix, on $FIX) or someone else holds that port on this host (then restore the tunnel from the Mac). Check: $DIR/cc_tunnel_test.sh";;
 esac
 
 if [ "$("$PYBIN" "$HERE/cc_hook.py" check 2>/dev/null)" != "ok" ]; then
@@ -1598,6 +1849,8 @@ write_receiver(){
 # The sender says what this is about (through the listener):
 #   CC_AGENT  who is notifying (Claude Code, Codex, ...) -> TITLE, set by the caller
 #   CC_LABEL  host/project             -> appended to the status line
+#   CC_KEY    the machine whose key signed the request (set by the listener, not
+#             the sender) -> leads the status line unless it is this Mac's own
 #   CC_TITLE  session title            -> the alert's subtitle
 #   CC_BRIEF  one-sentence summary of the round, or the question asked -> leads the body
 #   CC_BODY_FILE  file with the final message as plain text (line breaks, any length)
@@ -1613,8 +1866,11 @@ write_receiver(){
 # CC_TELEGRAM_BRIEF=0 sends the status line only.
 find_bin(){ for p in "$@"; do [ -n "$p" ] && [ -x "$p" ] && { printf '%s' "$p"; return 0; }; done; return 1; }
 
-# Which session/host finished (passed by the hook via ?label=...).
-[ -n "${CC_LABEL:-}" ] && MSG="$MSG — $CC_LABEL"
+# Which machine (verified by its key) and session/host finished (?label=... is the sender's word).
+case "${CC_KEY:-local}" in
+  local) [ -n "${CC_LABEL:-}" ] && MSG="$MSG — $CC_LABEL";;
+  *)     MSG="$MSG — ${CC_KEY}${CC_LABEL:+: $CC_LABEL}";;
+esac
 
 # --- optional phone push (relayed from THIS Mac; senders like Aurora may block Telegram) ---
 if [ -n "${CC_TELEGRAM_TOKEN:-}" ] && [ -n "${CC_TELEGRAM_CHAT_ID:-}" ]; then
@@ -1703,21 +1959,35 @@ CCN_EOF__attention_sh
 """Local alarm listener. Binds loopback on BOTH 127.0.0.1 and ::1 (ssh forwards
 `localhost` may hit ::1 first). Endpoints: /beep /alarm /done /ask /stop /ping.
 
-Alarms are kept per session: ?session=<id> on /alarm or /ask replaces only that
-session's alarm, and /stop?session=<id> silences only that one. /stop without a
-session (the stop hotkey, cc_stop.sh) silences them all. Requests that name no
-session share one slot.
+Ports. PORT (28765) is this Mac's own: its local senders (the stop hotkey, local
+sessions) and, while machines move to keys of their own, the key they all shared.
+Each remote machine has a port of its own, from PORT+1 on (its tunnel ends there:
+`RemoteForward 28765 localhost:<its port>`; cc_token.sh push assigns it, in
+<dir>/ports/<name>). A machine's key is taken, and proven, only on its own port, so
+a connection relayed through another machine's tunnel gets nothing, and each port
+has its own connection limit, so a flood on one tunnel does not silence the others.
 
-Guards:
-  - rejects requests carrying a non-local Origin header (browser CSRF / DNS-rebind);
-  - protocol 6: the token (<dir>/token) is a key that never travels. An action
-    is carried out only when the request is signed with it (X-CC-Time, X-CC-Nonce,
-    X-CC-Sig: see cc_client.py), within WINDOW seconds of its time, and its nonce
-    has not been seen before. /ping?c=<challenge> answers with a proof that this
-    listener holds the token, so a sender can tell it from anyone else who might
-    listen on the port at its end of the tunnel. Without a token file every action
-    is refused (and /ping says auth=none). The token is re-read per request, so
-    changing it needs no restart.
+Keys (protocol 7). One key per machine in <dir>/keys/<name>. A key is never sent
+anywhere. An action is carried out only when the request names a key that may be
+used on this port (X-CC-Key), is signed with it over the name and the request
+(X-CC-Time, X-CC-Nonce, X-CC-Sig: see cc_client.py), is within WINDOW seconds of its
+time, its nonce has not been seen before, and the key is within its rate limit.
+/ping?c=<challenge>&k=<name> answers with a proof that this listener holds that
+key, so a sender can tell it from anyone else who might listen at its end of the
+tunnel. A request that names no key is the form of protocol 6, checked against
+keys/shared on PORT only, and only while that file exists (`cc_token.sh revoke
+shared` retires it). Keys are read per request: issuing or revoking one needs no
+restart. Each request carried out or refused is one line in the log, with the
+key's name (refused ones at most one a second).
+
+Alarms are kept per machine and session: ?session=<id> on /alarm or /ask replaces
+only that machine's alarm for that session, and /stop?session=<id> silences only
+that one. /stop without a session silences all of the sender's alarms; from this
+Mac's own key (the stop hotkey) it silences every alarm. The alarm gets the
+verified machine name as $CC_KEY, so the banner shows who really sent it.
+
+Guards against web pages: a request whose Origin, or whose Host, is not local is
+refused (browser CSRF / DNS rebinding).
 The ?agent=, ?label=, ?title= and ?brief= queries are sanitized and passed to the
 alarm as $CC_AGENT (who is notifying: Claude Code, Codex, ...), $CC_LABEL,
 $CC_TITLE and $CC_BRIEF ($CC_SESSION carries the session id). The message itself,
@@ -1730,56 +2000,104 @@ import hashlib, hmac, http.server, os, re, signal, socket, socketserver, subproc
 from urllib.parse import urlsplit, parse_qs
 
 PORT = int(os.environ.get("CC_NOTIFY_PORT", "28765"))
+TUNNEL_PORTS = range(PORT + 1, PORT + 17)  # one per remote machine (cc_token.sh push assigns them)
 HERE = os.path.dirname(os.path.abspath(__file__))
 ALARM = os.path.join(HERE, "cc_alarm.sh")
 BEEP = os.path.join(HERE, "cc_beep.sh")
 ASK = os.path.join(HERE, "cc_ask.sh")
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 BODIES = os.path.join(HERE, "tmp")      # message bodies on their way to the phone push
-PROTO = 6            # 2: per-session alarms, title + brief; 3: agent name, summary in the phone push; 4: message body in the phone push; 5: the whole message, posted; 6: signed requests, the token never travels. Reported by /ping.
+PROTO = 7            # 2: per-session alarms, title + brief; 3: agent name, summary in the phone push; 4: message body in the phone push; 5: the whole message, posted; 6: signed requests, the token never travels; 7: one key per machine. Reported by /ping.
 MAX_POST = 1 << 20   # bytes of posted text read from one request
 MAX_BODY = 60000     # characters of it passed on (about fifteen Telegram messages)
 MAX_ALARMS = 16      # alarms alive at once; the oldest gives way beyond this
 WINDOW = 300         # seconds a signed request stays good (the two clocks may differ by this much)
 DEADLINE = 5         # seconds a connection has for its whole request; a slow one is cut off
-MAX_CONNECTIONS = 64 # connections handled at once; more are closed at once (a flood cannot pin every thread)
+MAX_CONNECTIONS = 32 # connections handled at once on each port; more are closed at once
+RATE = (20, 3.0)     # per key: a burst of 20 requests, then one every 3 seconds
 HEX32 = re.compile(r"[0-9a-f]{32}\Z"); HEX64 = re.compile(r"[0-9a-f]{64}\Z"); TIME = re.compile(r"[0-9]{1,12}\Z")
+NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z"); KEYLIKE = re.compile(r"[0-9a-f]{24,}\Z")
 
-_lock = threading.Lock(); _alarms = {}   # session id ("" = none given) -> alarm process
-_seen = {}                               # nonce -> when it was used; a nonce is good once
+_lock = threading.Lock()
+_alarms = {}     # (machine, session id) -> alarm process
+_seen = {}       # nonce -> when it was used; a nonce is good once
+_buckets = {}    # machine -> (requests left, when counted)
 
 
-def _token():
-    """The shared token as bytes, b"" when there is none."""
+def valid_name(name):
+    """A machine's key name: lowercase (macOS file names ignore case), not one the
+    kit uses for its own files, not the shared key's."""
+    return bool(NAME.match(name)) and name != "shared" and ".." not in name and not KEYLIKE.match(name) \
+        and not re.search(r"\.(new|tmp|bak|port)\Z|\.tmp\.", name)
+
+
+def allowed(name, port):
+    """May the key `name` ("" = the shared key) be used on this port? This Mac's own
+    key and the shared key only on PORT; a remote machine's only on its own port."""
+    if port == PORT:
+        return name in ("", "local")
+    if not name or name == "local" or not valid_name(name):
+        return False
+    # The port must be this machine's, and no other machine's: two names on one
+    # port would let either one's connections be relayed for the other.
     try:
-        with open(os.path.join(HERE, "token"), "rb") as f:
+        holders = []
+        for other in os.listdir(os.path.join(HERE, "ports")):
+            if valid_name(other):
+                try:
+                    with open(os.path.join(HERE, "ports", other)) as f:
+                        if int(f.read().strip()) == port: holders.append(other)
+                except (OSError, ValueError):
+                    pass
+        return holders == [name]
+    except OSError:
+        return False
+
+
+def _key(name):
+    """The key of the machine called `name` ("" = the shared key); b"" when there is none."""
+    if name and not valid_name(name):
+        return b""
+    try:
+        with open(os.path.join(HERE, "keys", name or "shared"), "rb") as f:
             return f.read().strip()
     except Exception:
         return b""
 
 
 # The protocol; cc_client.py holds the same functions (tests/test_security.py checks they agree).
-def request_sig(key, method, path, query, body, t, nonce):
-    msg = "cc-notifier/6 req\n%s\n%s\n%s\n%s\n%d\n%s" % (
-        method, path, query, hashlib.sha256(body).hexdigest(), t, nonce)
+def request_sig(key, method, path, query, body, t, nonce, name=""):
+    """Protocol 7 when the request names its key, protocol 6 (the shared key) when not."""
+    digest = hashlib.sha256(body).hexdigest()
+    if name:
+        msg = "cc-notifier/7 req\n%s\n%s\n%s\n%s\n%s\n%d\n%s" % (name, method, path, query, digest, t, nonce)
+    else:
+        msg = "cc-notifier/6 req\n%s\n%s\n%s\n%s\n%d\n%s" % (method, path, query, digest, t, nonce)
     return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def ping_proof(key, challenge):
-    return hmac.new(key, ("cc-notifier/6 pong\n" + challenge).encode("utf-8"), hashlib.sha256).hexdigest()
+def ping_proof(key, challenge, name=""):
+    msg = ("cc-notifier/7 pong\n%s\n%s" % (name, challenge)) if name else ("cc-notifier/6 pong\n" + challenge)
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def check_request(key, headers, method, path, query, body, now=None):
+def check_request(headers, method, path, query, body, port, now=None):
     """-> None when the request may be carried out, else (HTTP status, reason)."""
+    name = headers.get("X-CC-Key") or ""
+    if name and not valid_name(name):
+        return 403, "not a key name"
+    if not allowed(name, port):
+        return 403, ("%s may not send on this port" % name) if name else "names no key, which this port does not take"
+    key = _key(name)
     if not key:
-        return 403, "no token on the listener"
+        return 403, ("no key for %s" % name) if name else "names no key, and the shared key is retired"
     t, nonce, sig = (headers.get(h) or "" for h in ("X-CC-Time", "X-CC-Nonce", "X-CC-Sig"))
     if not (TIME.match(t) and HEX32.match(nonce) and HEX64.match(sig)):
         return 401, "not signed"
     now = time.time() if now is None else now
     if abs(now - int(t)) > WINDOW:
         return 401, "too old or too new (the clocks differ by %d s?)" % (now - int(t))
-    if not hmac.compare_digest(sig.encode(), request_sig(key, method, path, query, body, int(t), nonce).encode()):
+    if not hmac.compare_digest(sig.encode(), request_sig(key, method, path, query, body, int(t), nonce, name).encode()):
         return 403, "bad signature"
     with _lock:
         if len(_seen) > 2048:
@@ -1787,13 +2105,37 @@ def check_request(key, headers, method, path, query, body, now=None):
         if nonce in _seen:
             return 403, "replayed"
         _seen[nonce] = now
+        left, then = _buckets.get(name, (RATE[0], now))
+        left = min(RATE[0], left + (now - then) / RATE[1])
+        if left < 1:
+            _buckets[name] = (left, now)
+            return 429, "too many requests from %s" % (name or "shared")
+        _buckets[name] = (left - 1, now)
     return None
 
 
-def _note(line):
-    """One line for the launchd log: what was refused, never a secret."""
+_gate = {"last": 0.0, "dropped": 0}
+
+
+def _note(line, limited=False):
+    """One line for the log: what was done or refused, for which key; never a
+    secret. Refused requests (anyone can send those) at most one a second."""
+    if limited:
+        with _lock:
+            now = time.time()
+            if now - _gate["last"] < 1.0:
+                _gate["dropped"] += 1
+                return
+            if _gate["dropped"]:
+                line += " (and %d more refused before this)" % _gate["dropped"]
+            _gate["last"], _gate["dropped"] = now, 0
     try: print(time.strftime("%Y-%m-%dT%H:%M:%SZ ", time.gmtime()) + line, file=sys.stderr, flush=True)
     except Exception: pass
+
+
+def _clean(s, limit=80):
+    """Untrusted text for a log line: printable ASCII only, bounded."""
+    return re.sub(r"[^\x21-\x7e]", "?", s)[:limit]
 
 
 def _text(s, limit):
@@ -1838,27 +2180,34 @@ def _kill(p):
         except ProcessLookupError: pass
 
 
-def stop_alarm(session=None):
-    """Silence one session's alarm, or every alarm when no session is named."""
+def stop_alarm(owner, session=None):
+    """Silence the alarms of machine `owner` (that session's, or all of them). This
+    Mac's own key ("local") reaches every machine's alarms."""
     with _lock:
-        for key in (list(_alarms) if session is None else [session]):
-            p = _alarms.pop(key, None)
-            if p: _kill(p)
+        for (who, sid) in list(_alarms):
+            if (owner == "local" or who == owner) and (session is None or sid == session):
+                _kill(_alarms.pop((who, sid)))
 
 
-def start_proc(script, session="", **fields):
+def start_proc(script, owner, session="", **fields):
     env = dict(os.environ)
     env.update({k: v for k, v in fields.items() if v})
     with _lock:
-        for key in [k for k, p in _alarms.items() if p.poll() is not None]: del _alarms[key]
-        old = _alarms.pop(session, None)
+        for k in [k for k, p in _alarms.items() if p.poll() is not None]: del _alarms[k]
+        old = _alarms.pop((owner, session), None)
         if old: _kill(old)
         while len(_alarms) >= MAX_ALARMS: _kill(_alarms.pop(next(iter(_alarms))))
-        _alarms[session] = subprocess.Popen(["/bin/bash", script], start_new_session=True, env=env)
+        _alarms[(owner, session)] = subprocess.Popen(["/bin/bash", script], start_new_session=True, env=env)
 
 
 def play_beep():
     subprocess.Popen(["/bin/bash", BEEP], start_new_session=True)
+
+
+def _local(value):
+    """Is this Origin / Host value a local address?"""
+    try: return urlsplit(value if "//" in value else "//" + value).hostname in LOCAL_HOSTS
+    except ValueError: return False
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -1880,18 +2229,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try: super().finish()
         except OSError: pass
     def _route(self):
-        origin = self.headers.get("Origin")
-        if origin and urlsplit(origin).hostname not in LOCAL_HOSTS:
+        origin, host = self.headers.get("Origin"), self.headers.get("Host")
+        if (origin and not _local(origin)) or (host is not None and not _local(host)):
             self.send_response(403); self.end_headers(); return
+        port = self.server.server_address[1]
         u = urlsplit(self.path)
         path = u.path.rstrip("/")
-        key = _token()
         q = parse_qs(u.query)
         arg = lambda name: q.get(name, [""])[0]
         if path in ("/ping", ""):
-            words = ["ok", "proto=%d" % PROTO]
-            if not key: words.append("auth=none")
-            elif HEX32.match(arg("c")): words.append("proof=" + ping_proof(key, arg("c")))
+            words, k = ["ok", "proto=%d" % PROTO], arg("k")
+            key = _key(k) if (not k or valid_name(k)) and allowed(k, port) else b""
+            if not key: words.append("key=unknown" if k else "shared=none")
+            elif HEX32.match(arg("c")): words.append("proof=" + ping_proof(key, arg("c"), k))
             return self._answer(200, " ".join(words))
         raw = b""
         if self.command == "POST":
@@ -1899,22 +2249,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except ValueError: size = 0
             if size > MAX_POST: self.send_response(413); self.end_headers(); return
             if size > 0: raw = self.rfile.read(size)
-        refused = check_request(key, self.headers, self.command, u.path, u.query, raw)
+        refused = check_request(self.headers, self.command, u.path, u.query, raw, port)
+        owner = self.headers.get("X-CC-Key") or "shared"
         if refused:
-            _note("refused %s %s: %s" % (self.command, path, refused[1]))
+            _note("refused %s %s from %s on port %d: %s" % (self.command, _clean(path), _clean(owner, 64), port, refused[1]),
+                  limited=True)
             return self._answer(refused[0], "refused: " + refused[1])
+        _note("%s %s from %s" % (self.command, _clean(path), owner))
         posted = raw.decode("utf-8", "replace")
         session = re.sub(r"[^A-Za-z0-9_-]", "", arg("session"))[:64]
-        fields = dict(CC_LABEL=re.sub(r"[^\w\-./ ]", "", arg("label"))[:64], CC_SESSION=session,
+        fields = dict(CC_LABEL=re.sub(r"[^\w\-./ ]", "", arg("label"))[:64], CC_SESSION=session, CC_KEY=owner,
                       CC_AGENT=_text(arg("agent"), 32), CC_TITLE=_text(arg("title"), 80),
                       CC_BRIEF=_text(arg("brief"), 400))
         if path in ("/alarm", "/done", "/ask"):
             fields["CC_BODY_FILE"] = _body_file(session, _body(posted or arg("body"), MAX_BODY))
         try:
-            if path in ("/alarm", "/done"): start_proc(ALARM, session, **fields); body = b"alarm\n"
-            elif path == "/ask": start_proc(ASK, session, **fields); body = b"ask\n"
+            if path in ("/alarm", "/done"): start_proc(ALARM, owner, session, **fields); body = b"alarm\n"
+            elif path == "/ask": start_proc(ASK, owner, session, **fields); body = b"ask\n"
             elif path == "/beep": play_beep(); body = b"beep\n"
-            elif path == "/stop": stop_alarm(session if "session" in q else None); body = b"stopped\n"
+            elif path == "/stop": stop_alarm(owner, session if "session" in q else None); body = b"stopped\n"
             else: self.send_response(404); self.end_headers(); return
         except OSError:                           # the alarm could not be started: say so, do not look delivered
             self.send_response(500); self.end_headers(); return
@@ -1928,25 +2281,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
 
-_slots = threading.BoundedSemaphore(MAX_CONNECTIONS); _busy = {"dropped": 0, "noted": 0.0}
+_busy = {"dropped": 0, "noted": 0.0}
 
 
 class Capped(socketserver.ThreadingTCPServer):
-    """At most MAX_CONNECTIONS handled at once (both loopback families together)."""
+    """At most MAX_CONNECTIONS handled at once on this port (and address family)."""
     allow_reuse_address = True; daemon_threads = True
+    def __init__(self, *args, **kwargs):
+        self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        super().__init__(*args, **kwargs)
     def process_request(self, request, client_address):
-        if not _slots.acquire(blocking=False):
+        slots = self.slots
+        if not slots.acquire(blocking=False):
             self.shutdown_request(request)
             _busy["dropped"] += 1
             if time.time() - _busy["noted"] > 60:
-                _note("busy: %d connections closed unanswered (more than %d at once)" % (_busy["dropped"], MAX_CONNECTIONS))
+                _note("busy: %d connections closed unanswered (more than %d at once on port %d)"
+                      % (_busy["dropped"], MAX_CONNECTIONS, self.server_address[1]))
                 _busy["noted"] = time.time()
             return
-        try: super().process_request(request, client_address)
-        except Exception: _slots.release(); raise
-    def process_request_thread(self, request, client_address):
-        try: super().process_request_thread(request, client_address)
-        finally: _slots.release()
+        def serve():
+            try: self.finish_request(request, client_address)
+            except Exception: self.handle_error(request, client_address)
+            finally:
+                self.shutdown_request(request); slots.release()
+        try: threading.Thread(target=serve, daemon=True).start()
+        except Exception: self.shutdown_request(request); slots.release()
 
 
 class V4(Capped): pass
@@ -1955,10 +2315,11 @@ class V6(Capped): address_family = socket.AF_INET6
 
 def main():
     servers = []
-    for cls, host in ((V4, "127.0.0.1"), (V6, "::1")):
-        try: servers.append(cls((host, PORT), Handler))
-        except OSError as e: print(f"warn: bind {host}:{PORT}: {e}", flush=True)
-    if not servers: raise SystemExit(f"could not bind {PORT}")
+    for port in [PORT] + list(TUNNEL_PORTS):
+        for cls, host in ((V4, "127.0.0.1"), (V6, "::1")):
+            try: servers.append(cls((host, port), Handler))
+            except OSError as e: print("warn: bind %s:%d: %s" % (host, port, e), file=sys.stderr, flush=True)
+    if not any(s.server_address[1] == PORT for s in servers): raise SystemExit("could not bind %d" % PORT)
     ts = [threading.Thread(target=s.serve_forever, daemon=True) for s in servers]
     for t in ts: t.start()
     for t in ts: t.join()
@@ -2370,35 +2731,74 @@ if __name__ == "__main__":
 CCN_EOF_cc_telegram_py
   cat > "$DIR/cc_tunnel_keep.sh" <<'CCN_EOF_cc_tunnel_keep_sh'
 #!/bin/bash
-# Keep the cc-notifier reverse tunnel alive (run periodically by launchd on the Mac).
-# It only ever touches the EXISTING ssh master (your shared ControlPath), so:
-#   - the forward stays co-located with your VSCode/CC session (right UAN), and
+# Keep the cc-notifier reverse tunnels alive (run periodically by launchd on the Mac).
+# It only ever touches EXISTING ssh masters (your shared ControlPath), so:
+#   - each forward stays co-located with your VSCode/CC session (right login node), and
 #   - NO new ssh connection is opened (nothing for an HPC admin to flag).
-# No-op unless CC_TUNNEL_HOST (your ssh host alias for the remote) is set in config.
+# No-op unless CC_TUNNEL_HOST is set in config: your ssh host alias for each remote,
+# separated by spaces or commas (CC_TUNNEL_HOST="aurora polaris").
+#
+# Each tunnel is checked with a proof only this Mac's listener can give, made with
+# that host's own key on that host's own port (ports/<host>; the shared key's
+# machines end at this Mac's own port). A forward is changed only when that is
+# clearly right: nothing listens at the far end (put it back), or the tunnel leads
+# to this Mac but to the wrong port (point it at the right one). A busy or silent
+# port, or someone else holding it, is left alone and logged: cancelling there
+# would hand the port to whoever grabs it first.
+export LC_ALL=C                              # character sets below mean ASCII, whatever the locale
 DIR="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"
 [ -f "$DIR/config" ] && . "$DIR/config"
-PORT="${CC_NOTIFY_PORT:-28765}"
-HOST="${CC_TUNNEL_HOST:-}"
-
-[ -n "$HOST" ] || exit 0                            # not configured -> off
-ssh -O check "$HOST" >/dev/null 2>&1 || exit 0      # no live master -> nothing to inject into
-
-# Already healthy? Ask the far end of the tunnel, over the master (no new
-# connection), for a proof that only this Mac's listener can give: it holds the
-# token. Any other answer - nothing, or someone else listening on that port on a
-# shared login node - means the forward has to be put back.
+PORT="${CC_NOTIFY_PORT:-28765}"             # this Mac's own port
+RPORT="${CC_REMOTE_PORT:-28765}"            # the port the hooks use at the far end
+HOSTS="$(printf '%s' "${CC_TUNNEL_HOST:-}" | tr ',' ' ')"
+[ -n "$HOSTS" ] || exit 0                                # not configured -> off
 PYBIN="$(command -v python3 || echo /usr/bin/python3)"
-c="$(CC_NOTIFIER_DIR="$DIR" "$PYBIN" "$DIR/cc_client.py" challenge 2>/dev/null)"
-if [ -n "$c" ] && ssh "$HOST" "curl -s --noproxy '*' --max-time 2 'http://localhost:${PORT}/ping?c=${c}'" 2>/dev/null \
-     | CC_NOTIFIER_DIR="$DIR" "$PYBIN" "$DIR/cc_client.py" verify "$c" >/dev/null 2>&1; then
-  exit 0
-fi
+say(){ echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+client(){ CC_NOTIFIER_DIR="$DIR" CC_NOTIFY_PORT="$PORT" "$PYBIN" "$DIR/cc_client.py" "$@"; }
 
-# Broken (forward missing or stale, or the port taken) -> refresh it on the live master.
-ssh -O cancel  -R "${PORT}:localhost:${PORT}" "$HOST" >/dev/null 2>&1
-if ! err="$(ssh -O forward -R "${PORT}:localhost:${PORT}" "$HOST" 2>&1)"; then
-  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) could not forward port ${PORT} on ${HOST}: ${err} (if the port is taken there, someone else holds it: nothing is sent to it)"
-fi
+# Without a working key of its own this Mac cannot tell a healthy tunnel from a
+# broken one: change nothing.
+case "$(client ping 2>/dev/null)" in
+  proto=*\ verified=yes\ as=local\ *) ;;
+  *) say "this Mac's own key does not work with its listener: run ~/.cc-notifier/cc_token.sh new (no tunnel touched)"; exit 0;;
+esac
+
+# probe <host> <query>: the far end's answer to /ping?<query>, then " curl_exit=<n>"
+probe(){ ssh "$1" "sh -c 'curl -s --noproxy \"*\" --max-time 2 \"http://localhost:$RPORT/ping?$2\"; echo \" curl_exit=\$?\"'" 2>/dev/null; }
+proves(){ printf '%s' "${1% curl_exit=*}" | client verify "$2" >/dev/null 2>&1; }
+
+for HOST in $HOSTS; do
+  case "$HOST" in [abcdefghijklmnopqrstuvwxyz0123456789]*) ;; *) say "skipping '$HOST': not a lowercase ssh alias"; continue;; esac
+  case "$HOST" in *[!abcdefghijklmnopqrstuvwxyz0123456789._-]*) say "skipping '$HOST': not a lowercase ssh alias"; continue;; esac
+  ssh -O check "$HOST" >/dev/null 2>&1 || continue      # no live master -> nothing to inject into
+  if [ -s "$DIR/keys/$HOST" ] && [ -s "$DIR/ports/$HOST" ]; then want="$(cat "$DIR/ports/$HOST")"; k="$HOST"
+  else want="$PORT"; k="local"; fi                      # still on the shared key: ends at this Mac's own port
+  q="$(client challenge "$k" 2>/dev/null)" || continue
+  out="$(probe "$HOST" "$q")"
+  proves "$out" "$q" && continue                         # healthy
+  ec="${out##*curl_exit=}"
+  case "$ec" in
+    7)  # nothing listens at the far end: put the forward back
+        ssh -O cancel -R "$RPORT:localhost:$PORT" "$HOST" >/dev/null 2>&1
+        ssh -O cancel -R "$RPORT:localhost:$want" "$HOST" >/dev/null 2>&1
+        if ! err="$(ssh -O forward -R "$RPORT:localhost:$want" "$HOST" 2>&1)"; then
+          say "could not forward port $RPORT on $HOST to $want: $err"
+        fi;;
+    0)  # something answered, but not with this host's proof: our listener on the wrong port?
+        if [ "$want" != "$PORT" ]; then
+          q2="$(client challenge local 2>/dev/null)"
+          if [ -n "$q2" ] && proves "$(probe "$HOST" "$q2")" "$q2"; then
+            ssh -O cancel -R "$RPORT:localhost:$PORT" "$HOST" >/dev/null 2>&1
+            ssh -O forward -R "$RPORT:localhost:$want" "$HOST" >/dev/null 2>&1 \
+              && say "$HOST: its tunnel led to port $PORT; now to $want (set 'RemoteForward $RPORT localhost:$want' under Host $HOST in ~/.ssh/config)"
+            continue
+          fi
+        fi
+        say "$HOST: something answers on port $RPORT there but cannot prove it is this Mac (someone else holds the port, or a relay): nothing is sent to it; left alone";;
+    *)  say "$HOST: no clear answer from port $RPORT there (curl exit ${ec:-?}: busy, or the check failed): left alone";;
+  esac
+done
+exit 0
 CCN_EOF_cc_tunnel_keep_sh
   cat > "$DIR/karabiner-stop.json" <<'CCN_EOF_karabiner_stop_json'
 {
@@ -2522,8 +2922,9 @@ install_launchd(){
   </array>
   <key>EnvironmentVariables</key><dict><key>CC_NOTIFY_PORT</key><string>$PORT</string></dict>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/ccnotifier.out.log</string>
-  <key>StandardErrorPath</key><string>/tmp/ccnotifier.err.log</string>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>$DIR/listener.log</string>
+  <key>StandardErrorPath</key><string>$DIR/listener.log</string>
 </dict></plist>
 PLIST_EOF
   launchctl unload "$plist" 2>/dev/null || true
@@ -2544,8 +2945,9 @@ install_tunnel_keeper(){
   <key>RunAtLoad</key><true/>
   <key>StartInterval</key><integer>60</integer>
   <key>WatchPaths</key><array><string>/etc/resolv.conf</string></array>
-  <key>StandardOutPath</key><string>/tmp/ccnotifier.tunnel.log</string>
-  <key>StandardErrorPath</key><string>/tmp/ccnotifier.tunnel.log</string>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>$DIR/tunnel.log</string>
+  <key>StandardErrorPath</key><string>$DIR/tunnel.log</string>
 </dict></plist>
 PLIST_EOF
   launchctl unload "$plist" 2>/dev/null || true
@@ -2599,9 +3001,7 @@ if [ "$ROLE" = receiver ]; then
   write_config
   apply_port
   secure_files
-  if [ ! -s "$DIR/token" ]; then
-    "$DIR/cc_token.sh" new 2>/dev/null && log "made a token ($DIR/token): every request is signed with it; the listener refuses anything else"
-  fi
+  receiver_keys
   merge_hooks
   codex_hooks
   if [ "$OS" = Darwin ]; then
@@ -2613,6 +3013,7 @@ if [ "$ROLE" = receiver ]; then
       fi
     fi
     install_launchd
+    own_key
     install_tunnel_keeper
     if [ -d "$HOME/.config/karabiner" ]; then
       mkdir -p "$HOME/.config/karabiner/assets/complex_modifications"
@@ -2623,6 +3024,7 @@ if [ "$ROLE" = receiver ]; then
     fi
     command -v alerter >/dev/null 2>&1 && alerter --title "cc-notifier" --message "installed — allow Terminal notifications (Alerts style); for Focus, allow Terminal in Work" --timeout 4 >/dev/null 2>&1 || true
   else
+    own_key
     log "NOTE: receiver role outside macOS — wrote files but skipped launchd/alerter."
   fi
   hdr "manual steps (one-time, GUI)"
@@ -2641,25 +3043,36 @@ if [ "$ROLE" = receiver ]; then
        (No Karabiner? A macOS Shortcut running $DIR/cc_stop.sh works everywhere
        EXCEPT the CC input box.)
   5. Pick sounds / repeats: $DIR/cc_preview_sounds.sh loop   (set knobs in $DIR/config)
-  6. For REMOTE machines: add to ~/.ssh/config under that host:
-       RemoteForward $PORT localhost:$PORT
-  7. Auto-heal the tunnel (REMOTE setups): set CC_TUNNEL_HOST=<your-ssh-alias>
-       in $DIR/config — the launchd keeper then re-injects the forward after
+  6. For REMOTE machines: give each one its key and port, from here:
+       $DIR/cc_token.sh push <ssh alias of the remote>
+     and put the line it prints under that host in ~/.ssh/config:
+       RemoteForward $PORT localhost:<the port it prints, one per remote>
+  7. Auto-heal the tunnels (REMOTE setups): set CC_TUNNEL_HOST="<alias> <alias>..."
+       in $DIR/config — the launchd keeper then re-injects each forward after
        network changes / reloads / wake (no new ssh connections).
   Test now:  $DIR/cc_tunnel_test.sh beep   (and: $DIR/cc_tunnel_test.sh ask)
   Arm/disarm any session:  $DIR/cc_notify_arm.sh on | off | status
   Diagnose anytime:  $DIR/cc_doctor.sh
-  Each REMOTE needs this Mac's token (it moves over ssh, never on a command line):
-       $DIR/cc_token.sh push <ssh alias of the remote>
+  Each REMOTE needs a key of its own from this Mac (it moves over ssh, never on a command line):
+       $DIR/cc_token.sh push <ssh alias of the remote>...
 EOF_NEXT
   if [ "$FROM_OLD" = 1 ]; then
-    hdr "now: a new token"
+    hdr "now: new keys"
     cat <<EOF_ROTATE
   The kit you had sent the token itself with every request, so it may have been
-  seen. Once each remote runs the new sender too (it refuses to hand a token to a
-  listener that cannot prove itself), replace the token everywhere at once:
+  seen. Once each remote runs the new sender too, give each one a new key of its
+  own, then retire the old token:
        $DIR/cc_token.sh rotate <ssh alias of each remote>...
+       $DIR/cc_token.sh revoke shared
 EOF_ROTATE
+  elif [ "$FROM_SHARED" = 1 ]; then
+    hdr "now: a key for each remote"
+    cat <<EOF_KEYS
+  Your remotes still share one token; it keeps working until you retire it.
+  Give each remote a key of its own, then retire the shared token:
+       $DIR/cc_token.sh push <ssh alias of each remote>...
+       $DIR/cc_token.sh revoke shared
+EOF_KEYS
   fi
 else
   write_sender
@@ -2679,16 +3092,16 @@ else
   Notifies on round-complete (Stop) and questions (AskUserQuestion).
   Anything else can notify too:  $DIR/cc_notify.sh --title "..." "one-sentence summary"
   This machine notifies your Mac THROUGH an ssh reverse tunnel. On your Mac:
-    1. Add to ~/.ssh/config under the host you use for this machine:
-         RemoteForward $PORT localhost:$PORT
-    2. Reconnect (or: ssh -O forward -R $PORT:localhost:$PORT <host>)
-    3. Make sure the Mac receiver is installed (run this script on the Mac).
-    4. Give this machine the Mac's token (over ssh, never on a command line):
+    1. Make sure the Mac receiver is installed (run this script on the Mac).
+    2. Give this machine a key of its own and its port, from the Mac (over ssh,
+       never on a command line):
          ~/.cc-notifier/cc_token.sh push <ssh alias of this machine>
+    3. Put the line that prints under that host in the Mac's ~/.ssh/config:
+         RemoteForward $PORT localhost:<its port>
   Verify from here:  $DIR/cc_tunnel_test.sh   (or full check: $DIR/cc_doctor.sh)
   Arm/disarm any session:  $DIR/cc_notify_arm.sh on | off | status
 EOF_NEXT
-  if [ ! -s "$DIR/token" ]; then log "NOTE: no token here yet, so nothing is sent: step 4."; fi
+  if [ ! -s "$DIR/token" ]; then log "NOTE: no key here yet, so nothing is sent: step 2."; fi
   if [ "$FROM_OLD" = 1 ]; then
     log "NOTE: until the Mac is updated too, its listener (protocol 5) still gets this machine's current token in a header. Then on the Mac: ~/.cc-notifier/cc_token.sh rotate <this machine>"
   fi

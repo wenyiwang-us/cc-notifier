@@ -25,7 +25,7 @@ No polling, no daemons you babysit: it rides the agents' hooks and a tiny launch
                                               afplay + alerter (sound + alert)
 ```
 
-The hooks are **identical** for local and remote use. The only difference: a remote machine reaches your Mac's listener through an SSH `RemoteForward`; a local Mac hits it directly. Every request is signed with a token both ends share, and the token itself never travels (see [Security](#security)).
+The hooks are **identical** for local and remote use. The only difference: a remote machine reaches your Mac's listener through an SSH `RemoteForward`; a local Mac hits it directly. Every request is signed with a key of that machine's own, which the Mac's listener also holds; the key itself never travels (see [Security](#security)).
 
 ## Requirements
 
@@ -62,17 +62,19 @@ Then finish the one-time GUI steps the installer prints:
 bash install.sh          # auto-detects Linux → sender role
 ```
 
-Then add **one line** to your Mac's `~/.ssh/config`, under the host you use for that machine:
-
-```
-RemoteForward 28765 localhost:28765
-```
-
-Reconnect (or `ssh -O forward -R 28765:localhost:28765 <host>`), and make sure the receiver is installed on your Mac. Then give the remote your Mac's token, from the Mac (it goes over ssh, on standard input, never on a command line):
+Make sure the receiver is installed on your Mac, connect to the remote, and give it a key and a port of its own, from the Mac (the key goes over ssh, on standard input, never on a command line):
 
 ```bash
-~/.cc-notifier/cc_token.sh push <host>
+~/.cc-notifier/cc_token.sh push <host>      # <host>: your ssh alias for it, in lowercase
 ```
+
+It prints the **one line** to put under that host in your Mac's `~/.ssh/config`, with the Mac port this remote's tunnel ends at (28766 for the first remote, 28767 for the next, ...); if you are connected through a shared ssh master, it also moves the live tunnel there for you:
+
+```
+RemoteForward 28765 localhost:28766
+```
+
+**More than one remote** (say Aurora and Polaris): `cc_token.sh push aurora polaris`, the printed line under each host, and both in `CC_TUNNEL_HOST` for the [tunnel keeper](#keeping-the-reverse-tunnel-alive-remote-setups). Each machine gets its own key and its own Mac port: a key is taken, and proven, only on its own machine's port, so you can replace or revoke one without touching the others, a connection relayed through another machine's tunnel gets nothing, and the banner and the Mac's log say which machine sent each request.
 
 Restart the Claude Code session so the hooks load. For Codex on that machine, see [Codex](#codex).
 
@@ -83,7 +85,7 @@ Restart the Claude Code session so the hooks load. For Codex on that machine, se
 ~/.cc-notifier/cc_notify_arm.sh off     # disarmed: short chime (you're at the desk)
 ~/.cc-notifier/cc_notify_arm.sh status
 
-~/.cc-notifier/cc_tunnel_test.sh ping   # is the path healthy? (the listener proves it holds the token; nothing rings)
+~/.cc-notifier/cc_tunnel_test.sh ping   # is the path healthy? (the listener proves it holds this machine's key; nothing rings)
 ~/.cc-notifier/cc_tunnel_test.sh beep   # fire each notification type to test
 ~/.cc-notifier/cc_tunnel_test.sh alarm  # alarm/ask carry a sample title + summary
 ~/.cc-notifier/cc_tunnel_test.sh ask
@@ -119,7 +121,7 @@ screen. Use a distinct `--session` for independent work; the default is
 `CODEX_THREAD_ID` when set, otherwise `manual`. `--agent NAME` sets who the alert
 is from; run from inside Codex or Claude Code it names that agent by itself.
 
-This command uses the existing token and tunnel (the request is signed like the
+This command uses the machine's key and tunnel (the request is signed like the
 hooks' requests) and bypasses proxies for localhost. An agent whose hooks are wired already notifies at every round end,
 so call it from the agent only for something the hooks do not cover.
 
@@ -130,7 +132,7 @@ so call it from the agent only for something the hooks do not cover.
 | `Stop` | — | round complete → `/beep` (disarmed) or `/alarm` (armed), with the session title and a one-sentence summary; skips turns < 20s and stops that are only a pause on the session's own background work |
 | `PreToolUse` | `AskUserQuestion` | CC needs your input → `/ask` (always), with the question as the summary |
 | `UserPromptSubmit` | — | start this session's turn clock; a prompt you typed cancels this session's alarm |
-| `SessionStart` | — | warn in-context if the listener is unreachable, cannot prove it holds this machine's token, or is older than the hooks |
+| `SessionStart` | — | warn in-context if the listener is unreachable, cannot prove it holds this machine's key, has no key for it, or is older than the hooks |
 
 Merged idempotently — re-running the installer never duplicates hooks or clobbers your existing ones.
 
@@ -181,7 +183,7 @@ Each session (a Claude Code session, a Codex thread) keeps its own state in `~/.
 … prompt keep session=f4903eb2 agent=claude kind=task-notification turn=running
 ```
 
-`err=` says what kept a request from going out: `unreachable` (no tunnel), `unverified` (something answers on the port but cannot prove it holds the token: the tokens differ, or someone else holds the port), `no_token` (none on this machine), `listener_has_no_token`, `old_listener_proto<N>` (the Mac needs the current installer). `auth=legacy` appears only on a machine upgraded from protocol 5 while its Mac still runs that version (see [Security](#security)).
+`err=` says what kept a request from going out: `unreachable` (no tunnel), `unverified` (something answers on the port but cannot prove it holds this machine's key: the keys differ, or someone else holds the port), `no_token` (no key on this machine), `key_unknown_at_listener` (the Mac has no key under this machine's name: never issued, or revoked), `no_key_for_this_machine` (this machine still has the shared key, which the Mac has retired, or its tunnel ends at a remote's port), `old_listener_proto<N>` (the Mac needs the current installer); `http=429` means this machine sent more than its rate allows (a burst of 20, then one every 3 s). The listener's answers that lead to these can be imitated by whoever holds the port when the tunnel is down, so the messages say so. `auth=signed` is a request signed with the machine's own key; `auth=shared` one signed with the key all machines shared before protocol 7, which works on the Mac's own port until `cc_token.sh revoke shared`; `auth=legacy` appears only on a machine upgraded from protocol 5 while its Mac still runs that version (see [Security](#security)).
 
 Both ends must be current: these hooks send only signed requests (protocol 6), which a listener older than that cannot check, so it gets nothing (`cc_doctor.sh` and the `SessionStart` check say so). The one exception is the move from protocol 5, described under [Security](#security).
 
@@ -299,13 +301,13 @@ Caveats:
 
 ## Keeping the reverse tunnel alive (remote setups)
 
-The reverse tunnel rides your SSH connection, so a network change, window reload, or sleep can drop it (and `ControlPersist` may reuse a stale master that lost the forward). To self-heal, set your ssh host alias in `~/.cc-notifier/config`:
+The reverse tunnel rides your SSH connection, so a network change, window reload, or sleep can drop it (and `ControlPersist` may reuse a stale master that lost the forward). To self-heal, set your ssh host alias in `~/.cc-notifier/config`, or several, separated by spaces:
 
 ```sh
-CC_TUNNEL_HOST=aurora
+CC_TUNNEL_HOST="aurora polaris"
 ```
 
-A launchd keeper (`com.ccnotifier.tunnel`, installed on the Mac) then checks the tunnel **every 60s and immediately on a network change** (it watches `/etc/resolv.conf`) and re-injects the `RemoteForward` if it's down. It only ever acts on your **existing** SSH master (shared `ControlPath`), so it opens **no new connections** (nothing for an HPC admin to flag) and keeps the forward on the same node as your session. The `SessionStart` healthcheck still warns in-session if the tunnel is down.
+A launchd keeper (`com.ccnotifier.tunnel`, installed on the Mac) then checks the tunnel **every 60s and immediately on a network change** (it watches `/etc/resolv.conf`) and checks each host's tunnel with a proof only your own listener can give, made with that host's key on that host's port. It changes a forward only when that is clearly right: nothing listens at the far end (it puts the forward back), or the tunnel leads to your Mac but to the wrong port (it points it at the right one). A busy port, or someone else holding it, is left alone and logged in `~/.cc-notifier/tunnel.log`: cancelling there would hand the port to whoever grabs it first. If this Mac's own key does not work, it changes nothing and says to run `cc_token.sh new`. It only ever acts on your **existing** SSH master (shared `ControlPath`), so it opens **no new connections** (nothing for an HPC admin to flag) and keeps the forward on the same node as your session. The `SessionStart` healthcheck still warns in-session if the tunnel is down.
 
 ## Troubleshooting
 
@@ -329,18 +331,24 @@ bash install.sh --uninstall     # removes hooks + launchd; leaves ~/.cc-notifier
 
 The listener is loopback-only and never runs as root. What a shared remote host means for it, and what protects you:
 
-- **Anyone on a shared login node can reach the port.** An ssh `RemoteForward` binds the port on the *remote's* loopback, so every user of that host can send to it. **Every request is therefore signed** with a token both ends share (`~/.cc-notifier/token`, made by the Mac's installer): an HMAC-SHA256 over the method, path, query, body, time and a one-time nonce. The listener carries out a request only when the signature is right, the time is within 5 minutes, and the nonce is new, so a copied request can be neither changed nor sent again. Without a token file the listener refuses everything.
-- **The token never travels.** It is a key, not a password: no request carries it, so whoever sees the traffic cannot reuse it. That matters on a shared host: when the tunnel is down, any user there can listen on the port. So before sending anything a sender asks the listener for a proof (`/ping?c=<random>` must come back with `HMAC(token, challenge)`), and a listener that cannot give one gets nothing, neither the request nor the message. The Mac's tunnel keeper checks the same proof, so it notices when the port on the remote is not leading to your Mac.
-- **Slow or idle connections are cut off.** A connection has 5 seconds for its whole request, and at most 64 are handled at once, so a few connections that send nothing cannot tie the listener up. Anyone on the node can still flood the port, though, and that also loads your ssh connection: the request checks keep the alarms honest, not always on time.
+- **Anyone on a shared login node can reach the port.** An ssh `RemoteForward` binds the port on the *remote's* loopback, so every user of that host can send to it. **Every request is therefore signed** with the sending machine's own key: the Mac keeps one per machine (`~/.cc-notifier/keys/<name>`, the name being the ssh alias it was issued to), each machine keeps its own (`~/.cc-notifier/token`, and its name in `key-name`). The signature is an HMAC-SHA256 over the key's name, the method, path, query, body, time and a one-time nonce. The listener carries out a request only when the signature is right for the key the request names, the time is within 5 minutes, and the nonce is new, so a copied request can be neither changed, nor sent again, nor passed off as another machine's. Without a key the listener refuses everything; every request it carries out or refuses is one line in its log (`~/.cc-notifier/listener.log`, readable by you only), with the machine's name; untrusted text is cleaned, and refused requests are logged at most one a second.
+- **One port per remote, so a relay gets nothing.** If a remote's tunnel is down, a user on that login node could otherwise pass its connections on through *another* machine's live tunnel into your Mac, and the Mac would prove itself. So each remote's tunnel ends at a Mac port of its own (`ports/<name>`), and its key is taken, and proven, only there; this Mac's own key (`local`) and the shared key only on 28765. Each port has its own connection limit, so a flood on one tunnel does not silence the others.
+- **Each machine's alarms are its own.** The banner shows the machine whose key signed the request (not the label the sender chose); a session's alarm can be replaced or stopped only by the same machine; a remote's `/stop` reaches only its own alarms (the Mac's stop hotkey reaches all); and each key has a rate limit (a burst of 20, then one every 3 s), so a leaked key cannot flood the alarm or the phone.
+- **A key never travels.** It is a key, not a password: no request carries it, so whoever sees the traffic cannot reuse it. That matters on a shared host: when the tunnel is down, any user there can listen on the port. So before sending anything a sender asks the listener for a proof (`/ping?c=<random>&k=<name>` must come back with an HMAC of the challenge under that machine's key), and a listener that cannot give one gets nothing, neither the request nor the message. The Mac's tunnel keeper checks the same kind of proof, so it notices when the port on a remote is not leading to your Mac.
+- **Slow or idle connections are cut off.** A connection has 5 seconds for its whole request, and at most 32 are handled at once on each port, so a few connections that send nothing cannot tie the listener up. Anyone on a login node can still flood that remote's tunnel, though, and that also loads your ssh connection: the request checks keep the alarms honest, not always on time.
 - **Nothing secret goes on a command line.** Other users of a shared host can read every process's arguments. The token, the Telegram bot token and the message texts reach `curl` and the client through standard input, files or the environment (which only you can read), never as arguments.
-- **Moving the token.** It goes over ssh, on standard input:
+- **One key per machine.** The Mac issues them, and they go over ssh, on standard input:
   ```bash
-  ~/.cc-notifier/cc_token.sh push <host>...     # copy the Mac's token to each remote
-  ~/.cc-notifier/cc_token.sh rotate <host>...   # a new token everywhere at once (refuses if an end is not ready for it)
+  ~/.cc-notifier/cc_token.sh push <host>...     # give each remote its own key and port (made if it has none)
+  ~/.cc-notifier/cc_token.sh rotate <host>...   # a new key for those hosts; the others are not touched
+  ~/.cc-notifier/cc_token.sh revoke <host>...   # forget a host's key: it can no longer send
+  ~/.cc-notifier/cc_token.sh keys               # the machines that have a key
   ```
-  `cc_token.sh set` on a remote reads a token from standard input and refuses one given as an argument.
+  A key is first staged on the host, then both ends switch. If sending it fails, nothing changes for that host; if the host then fails to switch, it cannot send until you `push` it again, and the tool says so. `push` and `rotate` refuse unless the Mac's listener and the host's sender both speak protocol 7, and refuse a host whose kit already holds another host's key (one home under two names). Names are lowercase (macOS file names ignore case). `cc_token.sh set <name>` on a remote reads a key from standard input, refuses one given as an argument, and refuses a name that looks like a key.
+- **Moving from one shared token.** Before protocol 7 every machine shared one token. The Mac's installer keeps it as `keys/shared`, taken on the Mac's own port only, so those machines keep working (`auth=shared`) while you give each one a key of its own; once all have theirs, `cc_token.sh revoke shared` retires it. Until then the machines on it are one identity to the listener: one of them can stop or replace the others' alarms and use up their common rate.
+- **What remains.** Anyone on a login node can flood that remote's tunnel (the alarms stay honest, but may be late or lost), and a sender pings and then sends on a second connection, so if the tunnel dropped in that instant and someone took the port, the message (not the key) would reach them.
 - **Private files.** The installer keeps `~/.cc-notifier` readable by you only: the token, the config (with the Telegram bot token) and the message texts on their way to the phone. `cc_doctor.sh` flags anything that is not.
-- **Browser requests.** The listener rejects any request carrying a non-local `Origin` header, blocking CSRF / DNS-rebinding from web pages.
+- **Browser requests.** The listener rejects any request whose `Origin` or `Host` is not a local address, blocking CSRF and DNS rebinding from web pages.
 - **Moving from protocol 5.** The previous version sent the token itself in a header. A remote upgraded from it keeps `legacy-token.sha256`, the hash of the token it had; while the Mac still runs protocol 5, and for at most 72 hours, that remote keeps serving it the old way, with that same token only (never on a command line). Once the Mac's listener has proved itself the file is deleted and the token never leaves the remote again; a new token never matches the file. So: update the Mac (re-run `install.sh` there), then `cc_token.sh rotate <each remote>`.
 
 ## Development

@@ -17,6 +17,7 @@ class NotifyTests(unittest.TestCase):
         self.listener = H.Listener(TOKEN)
         self.directory = H.private_dir("ccn-")
         H.write(os.path.join(self.directory, "token"), TOKEN + "\n")
+        H.write(os.path.join(self.directory, "key-name"), "m1\n")
         self.env = dict(os.environ, CC_NOTIFIER_DIR=self.directory,
                         CC_NOTIFY_PORT=str(self.listener.port), CC_NOTIFY_TIMEOUT="1",
                         CC_NOTIFY_LOG=os.path.join(self.directory, "hook.log"),
@@ -83,7 +84,7 @@ class NotifyTests(unittest.TestCase):
         result = self.run_sender("Ready.")
         self.assertEqual(result.returncode, 1)
         self.assertIn("err=unverified", result.stderr)
-        self.assertIn("different tokens", result.stderr)
+        self.assertIn("different keys", result.stderr)
         self.assertEqual(H.CALLS, [])
 
     def test_connection_failure_returns_nonzero(self):

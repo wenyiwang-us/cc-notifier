@@ -14,5 +14,10 @@ tmp/
 # secrets and per-machine files: never in the repo, wherever a test or a slip puts them
 token
 token.*
+key-name
+key-name.*
+keys/
+ports/
+*.new
 legacy-token.sha256
 config

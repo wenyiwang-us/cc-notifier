@@ -40,8 +40,11 @@ L = load("cc_alarm_listener", os.path.join(RECEIVER, "cc_alarm_listener.py"))
 CALLS = []
 
 
-def _start_proc(script, session="", **fields):
-    rec = dict(act=os.path.basename(script), session=session, fields=dict(fields))
+REAL = dict(start_proc=L.start_proc, stop_alarm=L.stop_alarm)
+
+
+def _start_proc(script, owner, session="", **fields):
+    rec = dict(act=os.path.basename(script), owner=owner, session=session, fields=dict(fields))
     if fields.get("CC_BODY_FILE"):
         with open(fields["CC_BODY_FILE"], encoding="utf-8") as f:
             rec["body"] = f.read()
@@ -50,7 +53,7 @@ def _start_proc(script, session="", **fields):
 
 L.start_proc = _start_proc
 L.play_beep = lambda: CALLS.append(dict(act="beep"))
-L.stop_alarm = lambda session=None: CALLS.append(dict(act="stop", session=session))
+L.stop_alarm = lambda owner, session=None: CALLS.append(dict(act="stop", owner=owner, session=session))
 
 
 def private_dir(prefix):
@@ -66,16 +69,29 @@ def write(path, text, mode=0o600):
 
 
 class Listener:
-    def __init__(self, token=None):
+    """The real listener on spare ports. `base` stands for the Mac's own port (keys
+    "local" and "shared"); each other machine's key gets a port of its own
+    (ports/<name>), and `spare` ports are bound and free for cc_token.sh to assign.
+    keys: {name: key}; `token` under `name` is the usual one; `shared`: the key all
+    machines shared before protocol 7."""
+    def __init__(self, token=None, name="m1", shared=None, keys=None, spare=4):
         self.dir = private_dir("ccl-")
+        for sub in ("keys", "ports"):
+            os.mkdir(os.path.join(self.dir, sub), 0o700)
+        allkeys = dict(keys or {})
         if token is not None:
-            write(os.path.join(self.dir, "token"), token + "\n")
+            allkeys[name] = token
+        if shared is not None:
+            allkeys["shared"] = shared
+        for n, v in allkeys.items():
+            write(os.path.join(self.dir, "keys", n), v + "\n")
         self.raw = []
         raw = self.raw
 
         class Recording(L.Handler):
             def _route(h):
-                entry = {"line": h.requestline, "headers": str(h.headers), "body": b""}
+                entry = {"line": h.requestline, "headers": str(h.headers), "body": b"",
+                         "port": h.server.server_address[1]}
                 inner = h.rfile
 
                 class Reader:
@@ -91,17 +107,39 @@ class Listener:
                 return L.Handler._route(h)
             do_GET = _route
             do_POST = _route
-
+        self.handler = Recording
         L.HERE = self.dir
         L.BODIES = os.path.join(self.dir, "tmp")
-        self.server = L.V4(("127.0.0.1", 0), Recording)
-        self.port = self.server.server_address[1]
-        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
+        self.servers = []
+        self.base = self._serve()
+        L.PORT = self.base                       # the listener's own port
+        self.ports = {}
+        for n in allkeys:
+            if n not in ("local", "shared"):
+                self.ports[n] = self._serve()
+                write(os.path.join(self.dir, "ports", n), "%d\n" % self.ports[n])
+        self.spare = [self._serve() for _ in range(spare)]
+        self.port = self.port_for(name)
         del CALLS[:]
 
+    def _serve(self):
+        srv = L.V4(("127.0.0.1", 0), self.handler)
+        self.servers.append(srv)
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
+        return srv.server_address[1]
+
+    def port_for(self, name):
+        """The port a machine's tunnel ends at: its own, or the base port."""
+        try:
+            with open(os.path.join(L.HERE, "ports", name)) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return self.ports.get(name, self.base)
+
     def close(self):
-        self.server.shutdown()
-        self.server.server_close()
+        for srv in self.servers:
+            srv.shutdown()
+            srv.server_close()
         shutil.rmtree(self.dir, ignore_errors=True)
 
 

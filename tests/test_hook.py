@@ -13,6 +13,21 @@ SENDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "
 sys.path.insert(0, SENDER)
 import cc_hook as h  # noqa: E402
 
+
+def _read(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def _load(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def _dump(obj, path):
+    with open(path, "w") as f:
+        json.dump(obj, f)
+
 TYPED = {"prompt": "please fix the bug"}
 TASK = {"prompt": "<task-notification>\n<task-id>b1</task-id>\n</task-notification>"}
 SHELL = {"id": "b1", "type": "shell", "status": "running", "description": "wait for the job"}
@@ -242,9 +257,9 @@ def test_sessions_are_independent_on_disk():
         assert run("prompt", a, d)[:2] == ["keep", "aaaaaaaa-1111"]
         # make A's turn old enough to notify, then let B fire prompts and stops around it
         path = os.path.join(d, "sessions", "aaaaaaaa-1111.json")
-        st = json.load(open(path))
+        st = _load(path)
         st.update(turn_start=st["turn_start"] - 600, human_start=st["human_start"] - 600)
-        json.dump(st, open(path, "w"))
+        _dump(st, path)
         assert run("prompt", b, d)[0] == "keep"
         assert run("prompt", dict(b, prompt=TASK["prompt"]), d)[0] == "keep"
         assert run("done", dict(b, last_assistant_message="ok"), d, "alarm")[0] == "silent"   # B's own quick turn
@@ -253,11 +268,11 @@ def test_sessions_are_independent_on_disk():
         assert out[5] == "Claude Code" and out[6].endswith("/proj"), out
         # the message itself, for the phone push, is left in files, line breaks and all
         assert out[7:] == [os.path.join(d, "sessions", "aaaaaaaa-1111" + x) for x in (".body", ".short")], out
-        assert open(out[7], encoding="utf-8").read() == "Done — 3 files changed. More detail below.\n\n• café.py\n• b.py"
-        assert open(out[8], encoding="utf-8").read() == open(out[7], encoding="utf-8").read()     # short enough: the same
+        assert _read(out[7]) == "Done — 3 files changed. More detail below.\n\n• café.py\n• b.py"
+        assert _read(out[8]) == _read(out[7])     # short enough: the same
         big = "\n".join("Line %d of a long report." % i for i in range(1000))
         out = run("done", dict(a, last_assistant_message=big, cwd="/x/proj"), d, "alarm")
-        whole, opening = open(out[7], encoding="utf-8").read(), open(out[8], encoding="utf-8").read()
+        whole, opening = _read(out[7]), _read(out[8])
         assert whole == big and len(opening) < 3500 and opening.startswith("Line 0 of") and "more characters in the session" in opening
         assert run("prompt", b, d)[0] == "keep"                    # B typing never cancels A's alarm
         assert run("prompt", a, d)[0] == "cancel"                  # A's own typed prompt does
@@ -265,14 +280,14 @@ def test_sessions_are_independent_on_disk():
         assert run("done", {}, d, "alarm")[0] == "notify"          # no session id: still notifies
         assert run("check", {}, d) == ["ok"]
         # the deferred check reads what the held stop left in the session's state
-        st = json.load(open(path))
+        st = _load(path)
         st.update(seq=7, busy=False, pending=dict(seq=7, title="Session A", brief="Queued — waiting", agent="Claude Code",
                                                  label="h/proj", body="Queued.\n\nStill waiting on 1 background task"))
-        json.dump(st, open(path, "w"))
+        _dump(st, path)
         assert run("late", {}, d, "alarm", "aaaaaaaa-1111", "6") == []          # an older check: nothing
         out = run("late", {}, d, "alarm", "aaaaaaaa-1111", "7")
         assert out[:4] == ["notify", "aaaaaaaa-1111", "Session A", "Queued — waiting"] and out[5:7] == ["Claude Code", "h/proj"], out
-        assert open(out[7], encoding="utf-8").read() == "Queued.\n\nStill waiting on 1 background task"
+        assert _read(out[7]) == "Queued.\n\nStill waiting on 1 background task"
         assert run("late", {}, d, "alarm", "aaaaaaaa-1111", "7") == []          # only once
 
 
@@ -287,9 +302,9 @@ def test_codex_payloads_use_the_same_path():
         out = run("prompt", dict(base, hook_event_name="UserPromptSubmit", prompt="draw the graph"), d, "codex")
         assert out[0] == "keep" and "agent=codex kind=typed" in out[2], out
         path = os.path.join(d, "sessions", "01a10977-ff71.json")
-        st = json.load(open(path))
+        st = _load(path)
         st.update(turn_start=st["turn_start"] - 600, human_start=st["human_start"] - 600)
-        json.dump(st, open(path, "w"))
+        _dump(st, path)
         stop = dict(base, hook_event_name="Stop", stop_hook_active=False,
                     last_assistant_message="**The graph is drawn.** It is saved as [fig.pdf](/home/u/paper/fig.pdf).")
         out = run("done", stop, d, "alarm", "codex")

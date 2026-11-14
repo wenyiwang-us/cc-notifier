@@ -48,12 +48,40 @@ hdr(){ printf '\n== %s ==\n' "$*"; }
 # files are written: a token, but no cc_client.py yet.
 FROM_OLD=0
 [ -s "$DIR/token" ] && [ ! -f "$DIR/cc_client.py" ] && FROM_OLD=1
+# Before protocol 7 every machine shared one token (a token, no key-name).
+FROM_SHARED=0
+[ -s "$DIR/token" ] && [ ! -s "$DIR/key-name" ] && FROM_SHARED=1
 
 secure_files(){
   chmod 700 "$DIR"
   local f
-  for f in token config legacy-token.sha256; do [ -f "$DIR/$f" ] && chmod 600 "$DIR/$f"; done
-  for f in sessions tmp; do [ -d "$DIR/$f" ] && chmod 700 "$DIR/$f"; done
+  for f in token key-name config legacy-token.sha256 listener.log tunnel.log; do [ -f "$DIR/$f" ] && chmod 600 "$DIR/$f"; done
+  for f in sessions tmp keys ports; do [ -d "$DIR/$f" ] && chmod 700 "$DIR/$f"; done
+  return 0
+}
+
+# The listener keeps one key per machine (keys/<name>) and, for each remote, the
+# port its tunnel ends at (ports/<name>). The token all machines shared before
+# stays as keys/shared until `cc_token.sh revoke shared`; this Mac's own senders
+# get keys/local. Keys the listener reads come first, before it is (re)started ...
+receiver_keys(){
+  mkdir -p "$DIR/keys" "$DIR/ports"; chmod 700 "$DIR/keys" "$DIR/ports"
+  if [ "$FROM_SHARED" = 1 ] && [ ! -e "$DIR/keys/shared" ]; then cp "$DIR/token" "$DIR/keys/shared"; fi
+  if [ ! -s "$DIR/keys/local" ]; then
+    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$DIR/keys/local.new" && [ -s "$DIR/keys/local.new" ] \
+      && mv -f "$DIR/keys/local.new" "$DIR/keys/local" \
+      && log "made this Mac's own key ($DIR/keys/local); every request is signed with a key the listener has, nothing else is carried out" \
+      || { echo "ERROR: could not make this Mac's own key in $DIR/keys" >&2; exit 1; }
+  fi
+  return 0
+}
+# ... and this Mac's own senders switch to its key after (repaired when it does not match).
+own_key(){
+  if ! cmp -s "$DIR/keys/local" "$DIR/token" || [ "$(cat "$DIR/key-name" 2>/dev/null)" != local ]; then
+    cp "$DIR/keys/local" "$DIR/token.tmp" && chmod 600 "$DIR/token.tmp" && mv -f "$DIR/token.tmp" "$DIR/token" \
+      && echo local > "$DIR/key-name" \
+      || { echo "ERROR: could not give this Mac's senders its key ($DIR/token, $DIR/key-name)" >&2; exit 1; }
+  fi
   return 0
 }
 
@@ -156,8 +184,9 @@ install_launchd(){
   </array>
   <key>EnvironmentVariables</key><dict><key>CC_NOTIFY_PORT</key><string>$PORT</string></dict>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/ccnotifier.out.log</string>
-  <key>StandardErrorPath</key><string>/tmp/ccnotifier.err.log</string>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>$DIR/listener.log</string>
+  <key>StandardErrorPath</key><string>$DIR/listener.log</string>
 </dict></plist>
 PLIST_EOF
   launchctl unload "$plist" 2>/dev/null || true
@@ -178,8 +207,9 @@ install_tunnel_keeper(){
   <key>RunAtLoad</key><true/>
   <key>StartInterval</key><integer>60</integer>
   <key>WatchPaths</key><array><string>/etc/resolv.conf</string></array>
-  <key>StandardOutPath</key><string>/tmp/ccnotifier.tunnel.log</string>
-  <key>StandardErrorPath</key><string>/tmp/ccnotifier.tunnel.log</string>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>$DIR/tunnel.log</string>
+  <key>StandardErrorPath</key><string>$DIR/tunnel.log</string>
 </dict></plist>
 PLIST_EOF
   launchctl unload "$plist" 2>/dev/null || true
@@ -233,9 +263,7 @@ if [ "$ROLE" = receiver ]; then
   write_config
   apply_port
   secure_files
-  if [ ! -s "$DIR/token" ]; then
-    "$DIR/cc_token.sh" new 2>/dev/null && log "made a token ($DIR/token): every request is signed with it; the listener refuses anything else"
-  fi
+  receiver_keys
   merge_hooks
   codex_hooks
   if [ "$OS" = Darwin ]; then
@@ -247,6 +275,7 @@ if [ "$ROLE" = receiver ]; then
       fi
     fi
     install_launchd
+    own_key
     install_tunnel_keeper
     if [ -d "$HOME/.config/karabiner" ]; then
       mkdir -p "$HOME/.config/karabiner/assets/complex_modifications"
@@ -257,6 +286,7 @@ if [ "$ROLE" = receiver ]; then
     fi
     command -v alerter >/dev/null 2>&1 && alerter --title "cc-notifier" --message "installed — allow Terminal notifications (Alerts style); for Focus, allow Terminal in Work" --timeout 4 >/dev/null 2>&1 || true
   else
+    own_key
     log "NOTE: receiver role outside macOS — wrote files but skipped launchd/alerter."
   fi
   hdr "manual steps (one-time, GUI)"
@@ -275,25 +305,36 @@ if [ "$ROLE" = receiver ]; then
        (No Karabiner? A macOS Shortcut running $DIR/cc_stop.sh works everywhere
        EXCEPT the CC input box.)
   5. Pick sounds / repeats: $DIR/cc_preview_sounds.sh loop   (set knobs in $DIR/config)
-  6. For REMOTE machines: add to ~/.ssh/config under that host:
-       RemoteForward $PORT localhost:$PORT
-  7. Auto-heal the tunnel (REMOTE setups): set CC_TUNNEL_HOST=<your-ssh-alias>
-       in $DIR/config — the launchd keeper then re-injects the forward after
+  6. For REMOTE machines: give each one its key and port, from here:
+       $DIR/cc_token.sh push <ssh alias of the remote>
+     and put the line it prints under that host in ~/.ssh/config:
+       RemoteForward $PORT localhost:<the port it prints, one per remote>
+  7. Auto-heal the tunnels (REMOTE setups): set CC_TUNNEL_HOST="<alias> <alias>..."
+       in $DIR/config — the launchd keeper then re-injects each forward after
        network changes / reloads / wake (no new ssh connections).
   Test now:  $DIR/cc_tunnel_test.sh beep   (and: $DIR/cc_tunnel_test.sh ask)
   Arm/disarm any session:  $DIR/cc_notify_arm.sh on | off | status
   Diagnose anytime:  $DIR/cc_doctor.sh
-  Each REMOTE needs this Mac's token (it moves over ssh, never on a command line):
-       $DIR/cc_token.sh push <ssh alias of the remote>
+  Each REMOTE needs a key of its own from this Mac (it moves over ssh, never on a command line):
+       $DIR/cc_token.sh push <ssh alias of the remote>...
 EOF_NEXT
   if [ "$FROM_OLD" = 1 ]; then
-    hdr "now: a new token"
+    hdr "now: new keys"
     cat <<EOF_ROTATE
   The kit you had sent the token itself with every request, so it may have been
-  seen. Once each remote runs the new sender too (it refuses to hand a token to a
-  listener that cannot prove itself), replace the token everywhere at once:
+  seen. Once each remote runs the new sender too, give each one a new key of its
+  own, then retire the old token:
        $DIR/cc_token.sh rotate <ssh alias of each remote>...
+       $DIR/cc_token.sh revoke shared
 EOF_ROTATE
+  elif [ "$FROM_SHARED" = 1 ]; then
+    hdr "now: a key for each remote"
+    cat <<EOF_KEYS
+  Your remotes still share one token; it keeps working until you retire it.
+  Give each remote a key of its own, then retire the shared token:
+       $DIR/cc_token.sh push <ssh alias of each remote>...
+       $DIR/cc_token.sh revoke shared
+EOF_KEYS
   fi
 else
   write_sender
@@ -313,16 +354,16 @@ else
   Notifies on round-complete (Stop) and questions (AskUserQuestion).
   Anything else can notify too:  $DIR/cc_notify.sh --title "..." "one-sentence summary"
   This machine notifies your Mac THROUGH an ssh reverse tunnel. On your Mac:
-    1. Add to ~/.ssh/config under the host you use for this machine:
-         RemoteForward $PORT localhost:$PORT
-    2. Reconnect (or: ssh -O forward -R $PORT:localhost:$PORT <host>)
-    3. Make sure the Mac receiver is installed (run this script on the Mac).
-    4. Give this machine the Mac's token (over ssh, never on a command line):
+    1. Make sure the Mac receiver is installed (run this script on the Mac).
+    2. Give this machine a key of its own and its port, from the Mac (over ssh,
+       never on a command line):
          ~/.cc-notifier/cc_token.sh push <ssh alias of this machine>
+    3. Put the line that prints under that host in the Mac's ~/.ssh/config:
+         RemoteForward $PORT localhost:<its port>
   Verify from here:  $DIR/cc_tunnel_test.sh   (or full check: $DIR/cc_doctor.sh)
   Arm/disarm any session:  $DIR/cc_notify_arm.sh on | off | status
 EOF_NEXT
-  if [ ! -s "$DIR/token" ]; then log "NOTE: no token here yet, so nothing is sent: step 4."; fi
+  if [ ! -s "$DIR/token" ]; then log "NOTE: no key here yet, so nothing is sent: step 2."; fi
   if [ "$FROM_OLD" = 1 ]; then
     log "NOTE: until the Mac is updated too, its listener (protocol 5) still gets this machine's current token in a header. Then on the Mac: ~/.cc-notifier/cc_token.sh rotate <this machine>"
   fi
