@@ -8,8 +8,12 @@ ok(){   printf "  ${g}OK${z}  %s\n" "$*"; }
 bad(){  printf "  ${r}XX${z}  %s\n" "$*"; }
 warn(){ printf "  ${y}??${z}  %s\n" "$*"; }
 note(){ printf "  ..  %s\n" "$*"; }
-HDR=(); [ -f "$DIR/token" ] && HDR=(-H "X-CC-Token: $(cat "$DIR/token")")
+HERE="$(cd "$(dirname "$0")" && pwd)"
+PYBIN="$(command -v python3 || echo /usr/bin/python3)"
 hc(){ curl -s --noproxy '*' --max-time 4 -o /dev/null -w '%{http_code}' "$@" 2>/dev/null; }
+# Asks the listener to prove it holds this machine's token; sends nothing else and
+# rings nothing. The token never travels and never appears on a command line.
+ping_out="$(CC_NOTIFY_PORT="$PORT" CC_NOTIFIER_DIR="$DIR" "$PYBIN" "$HERE/cc_client.py" ping 2>/dev/null)"
 
 printf "cc-notifier doctor — %s (%s)\n" "$(uname -n)" "$OS"
 
@@ -21,30 +25,28 @@ else bad "listener NOT reachable (HTTP ${code:-none})"
   else note "fix (tunnel down): from your Mac  ssh -O forward -R ${PORT}:localhost:${PORT} <host>"; fi
 fi
 
-# --- listener version + hook helper (per-session alarms, session title, brief) ---
+# --- listener version + auth (signed requests; the listener proves it holds the token) ---
 if [ "$code" = 200 ]; then
-  body="$(curl -s --noproxy '*' --max-time 4 "http://localhost:${PORT}/ping" 2>/dev/null)"
-  proto=1; case "$body" in *proto=*) proto="${body##*proto=}"; proto="${proto%%[!0-9]*}";; esac
-  if   [ "${proto:-1}" -ge 5 ]; then ok "listener is current (protocol ${proto}): one alarm per session, agent name, summary in the alert, the whole message in the phone push"
-  elif [ "${proto:-1}" -ge 4 ]; then warn "listener is one version behind these hooks (protocol ${proto}, need 5): the phone push stops at 3,500 characters — re-run install.sh on the Mac"
-  elif [ "${proto:-1}" -ge 3 ]; then warn "listener is behind these hooks (protocol ${proto}, need 5): the phone push carries only the one-sentence summary — re-run install.sh on the Mac"
-  elif [ "${proto:-1}" -ge 2 ]; then warn "listener is behind these hooks (protocol ${proto}, need 5): no summary in the phone push, every alarm titled Claude Code — re-run install.sh on the Mac"
-  else warn "listener is older than these hooks (protocol ${proto:-1}, need 5): one shared alarm, no title/summary — re-run install.sh on the Mac"; fi
+  case "$ping_out" in
+    proto=*\ verified=yes*) ok "listener is current and holds this machine's token (${ping_out%% *}): requests are signed, the token never travels";;
+    *legacy=yes*) warn "listener is protocol 5: it still gets the old token in a header — re-run install.sh on the Mac, then there: cc_token.sh rotate <this host>";;
+    *token=none*) bad "no token on this machine ($DIR/token): nothing is sent — on the Mac: cc_token.sh push <this host>";;
+    *listener_auth=none*) bad "the listener has no token, so it refuses everything — on the Mac: cc_token.sh new, then cc_token.sh push <each remote>";;
+    proto=[0-5]\ *) bad "listener is older than these hooks (${ping_out%% *}, need 6: signed requests), so nothing is sent to it — re-run install.sh on the Mac";;
+    *) bad "the listener cannot prove it holds this machine's token (${ping_out:-no answer}): the tokens differ (on the Mac: cc_token.sh push <this host>) or someone else holds port ${PORT} here — nothing is sent to it";;
+  esac
 fi
-PYBIN="$(command -v python3 || echo /usr/bin/python3)"
 [ "$("$PYBIN" "$DIR/cc_hook.py" check 2>/dev/null)" = "ok" ] && ok "hook helper runs ($PYBIN cc_hook.py)" \
   || bad "hook helper cannot run ($PYBIN $DIR/cc_hook.py) — hooks fall back to always notifying, no brief"
 n="$(find "$DIR/sessions" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
 note "per-session state: ${n} session(s) in $DIR/sessions; decisions are logged in $DIR/hook.log"
 
-# --- auth ---
-if [ -f "$DIR/token" ]; then
-  sc="$(hc "${HDR[@]}" "http://localhost:${PORT}/stop")"
-  [ "$sc" = 200 ] && ok "auth token accepted by listener" \
-                  || warn "token present but listener returned ${sc} — tokens differ between ends? (cc_token.sh)"
-else
-  warn "auth OFF (no $DIR/token). On a shared host others can reach the port. Enable: cc_token.sh new"
-fi
+# --- private files: the token, the config (Telegram bot token), the message texts ---
+for f in "$DIR" "$DIR/token" "$DIR/config" "$DIR/sessions" "$DIR/tmp"; do
+  [ -e "$f" ] || continue
+  m="$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null)"
+  case "$m" in 700|600|500|400) ;; *) bad "$f is readable by others (mode $m) — chmod go= $f";; esac
+done
 
 # --- arm + hooks ---
 [ -f "$DIR/armed" ] && note "armed (long alarm)" || note "disarmed (short chime)"
@@ -73,8 +75,9 @@ if [ "$OS" = Darwin ]; then
                                                    || warn "launchd agent not loaded (launchctl load …com.ccnotifier.listener.plist)"
   ( [ -f "$DIR/config" ] && . "$DIR/config"
     if [ -n "${CC_TELEGRAM_TOKEN:-}" ] && [ -n "${CC_TELEGRAM_CHAT_ID:-}" ]; then
-      curl -s --max-time 6 "https://api.telegram.org/bot${CC_TELEGRAM_TOKEN}/getMe" | grep -q '"ok":true' \
-        && ok "Telegram bot reachable + token valid" || warn "Telegram configured but getMe failed (token/network)"
+      # The bot token is part of the URL: curl reads it on stdin, not from its command line.
+      printf 'url = "https://api.telegram.org/bot%s/getMe"\n' "$CC_TELEGRAM_TOKEN" | curl -s --max-time 6 --config - \
+        | grep -q '"ok":true' && ok "Telegram bot reachable + token valid" || warn "Telegram configured but getMe failed (token/network)"
     else note "Telegram push not configured (optional)"; fi )
   note "alerter notification permission + Focus allow-list can't be checked here — verify by running: $DIR/cc_tunnel_test.sh alarm"
 else

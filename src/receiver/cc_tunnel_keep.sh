@@ -12,9 +12,19 @@ HOST="${CC_TUNNEL_HOST:-}"
 [ -n "$HOST" ] || exit 0                            # not configured -> off
 ssh -O check "$HOST" >/dev/null 2>&1 || exit 0      # no live master -> nothing to inject into
 
-# Already healthy? Test the real remote->Mac path over the master (no new connection).
-ssh "$HOST" "curl -s --noproxy '*' -o /dev/null --max-time 2 http://localhost:${PORT}/ping" >/dev/null 2>&1 && exit 0
+# Already healthy? Ask the far end of the tunnel, over the master (no new
+# connection), for a proof that only this Mac's listener can give: it holds the
+# token. Any other answer - nothing, or someone else listening on that port on a
+# shared login node - means the forward has to be put back.
+PYBIN="$(command -v python3 || echo /usr/bin/python3)"
+c="$(CC_NOTIFIER_DIR="$DIR" "$PYBIN" "$DIR/cc_client.py" challenge 2>/dev/null)"
+if [ -n "$c" ] && ssh "$HOST" "curl -s --noproxy '*' --max-time 2 'http://localhost:${PORT}/ping?c=${c}'" 2>/dev/null \
+     | CC_NOTIFIER_DIR="$DIR" "$PYBIN" "$DIR/cc_client.py" verify "$c" >/dev/null 2>&1; then
+  exit 0
+fi
 
-# Broken (forward missing or stale) -> refresh it on the live master.
+# Broken (forward missing or stale, or the port taken) -> refresh it on the live master.
 ssh -O cancel  -R "${PORT}:localhost:${PORT}" "$HOST" >/dev/null 2>&1
-ssh -O forward -R "${PORT}:localhost:${PORT}" "$HOST" >/dev/null 2>&1
+if ! err="$(ssh -O forward -R "${PORT}:localhost:${PORT}" "$HOST" 2>&1)"; then
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) could not forward port ${PORT} on ${HOST}: ${err} (if the port is taken there, someone else holds it: nothing is sent to it)"
+fi

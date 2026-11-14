@@ -10,3 +10,9 @@ armed
 turn_start
 sessions/
 tmp/
+
+# secrets and per-machine files: never in the repo, wherever a test or a slip puts them
+token
+token.*
+legacy-token.sha256
+config

@@ -17,7 +17,7 @@ No polling, no daemons you babysit: it rides the agents' hooks and a tiny launch
 ```
 [ machine running Claude Code / Codex ]               [ your Mac ]
   Stop / AskUserQuestion / ...  hooks
-        │  curl localhost:28765/<beep|alarm|ask|stop>
+        │  signed request to localhost:28765/<beep|alarm|ask|stop>
         ▼
    (local: direct)  ───────────────────────────────►  launchd listener
    (remote: ssh -R 28765 reverse tunnel) ───────────►  (127.0.0.1 + ::1)
@@ -25,12 +25,12 @@ No polling, no daemons you babysit: it rides the agents' hooks and a tiny launch
                                               afplay + alerter (sound + alert)
 ```
 
-The hooks are **identical** for local and remote use. The only difference: a remote machine reaches your Mac's listener through an SSH `RemoteForward`; a local Mac hits it directly.
+The hooks are **identical** for local and remote use. The only difference: a remote machine reaches your Mac's listener through an SSH `RemoteForward`; a local Mac hits it directly. Every request is signed with a token both ends share, and the token itself never travels (see [Security](#security)).
 
 ## Requirements
 
 - **Receiver (your Mac):** macOS, [Homebrew](https://brew.sh), and [`alerter`](https://github.com/vjeantet/alerter) (the installer runs `brew install vjeantet/tap/alerter`). `alerter` provides the Stop button; on macOS Tahoe 26 `terminal-notifier` no longer can.
-- **Sender (any machine where Claude Code or Codex runs):** `bash`, `curl`, `python3`.
+- **Sender (any machine where Claude Code or Codex runs):** `bash`, `python3` (3.6 or newer), and `curl` for the Mac's tunnel check.
 - **Remote senders:** the SSH server must allow reverse port forwarding (`AllowTcpForwarding`).
 
 ## Quick start
@@ -68,7 +68,13 @@ Then add **one line** to your Mac's `~/.ssh/config`, under the host you use for 
 RemoteForward 28765 localhost:28765
 ```
 
-Reconnect (or `ssh -O forward -R 28765:localhost:28765 <host>`), and make sure the receiver is installed on your Mac. Restart the Claude Code session so the hooks load. For Codex on that machine, see [Codex](#codex).
+Reconnect (or `ssh -O forward -R 28765:localhost:28765 <host>`), and make sure the receiver is installed on your Mac. Then give the remote your Mac's token, from the Mac (it goes over ssh, on standard input, never on a command line):
+
+```bash
+~/.cc-notifier/cc_token.sh push <host>
+```
+
+Restart the Claude Code session so the hooks load. For Codex on that machine, see [Codex](#codex).
 
 ## Usage
 
@@ -77,7 +83,7 @@ Reconnect (or `ssh -O forward -R 28765:localhost:28765 <host>`), and make sure t
 ~/.cc-notifier/cc_notify_arm.sh off     # disarmed: short chime (you're at the desk)
 ~/.cc-notifier/cc_notify_arm.sh status
 
-~/.cc-notifier/cc_tunnel_test.sh ping   # is the path healthy?
+~/.cc-notifier/cc_tunnel_test.sh ping   # is the path healthy? (the listener proves it holds the token; nothing rings)
 ~/.cc-notifier/cc_tunnel_test.sh beep   # fire each notification type to test
 ~/.cc-notifier/cc_tunnel_test.sh alarm  # alarm/ask carry a sample title + summary
 ~/.cc-notifier/cc_tunnel_test.sh ask
@@ -100,7 +106,9 @@ notification explicitly:
 ```
 
 The message is the one-sentence summary shown in the alert and the phone push;
-`--body TEXT` adds a longer text, line breaks kept, that only the phone push carries.
+`--body TEXT` adds a longer text, line breaks kept, that only the phone push carries,
+and `--body-file FILE` (`-` for standard input) reads it from a file. On a shared host,
+prefer the file: other users can read a command's arguments while it runs.
 `cc_notify.sh` waits for the listener, prints its HTTP result, and exits with
 status 1 when delivery fails (the Stop hook intentionally runs in the background
 and always exits 0). It honors the armed flag, or accepts `--action alarm`,
@@ -111,8 +119,8 @@ screen. Use a distinct `--session` for independent work; the default is
 `CODEX_THREAD_ID` when set, otherwise `manual`. `--agent NAME` sets who the alert
 is from; run from inside Codex or Claude Code it names that agent by itself.
 
-This command uses the existing token and tunnel and bypasses proxies for
-localhost. An agent whose hooks are wired already notifies at every round end,
+This command uses the existing token and tunnel (the request is signed like the
+hooks' requests) and bypasses proxies for localhost. An agent whose hooks are wired already notifies at every round end,
 so call it from the agent only for something the hooks do not cover.
 
 ## Hooks installed (user-level `~/.claude/settings.json`)
@@ -122,7 +130,7 @@ so call it from the agent only for something the hooks do not cover.
 | `Stop` | — | round complete → `/beep` (disarmed) or `/alarm` (armed), with the session title and a one-sentence summary; skips turns < 20s and stops that are only a pause on the session's own background work |
 | `PreToolUse` | `AskUserQuestion` | CC needs your input → `/ask` (always), with the question as the summary |
 | `UserPromptSubmit` | — | start this session's turn clock; a prompt you typed cancels this session's alarm |
-| `SessionStart` | — | warn in-context if the listener is unreachable or older than the hooks |
+| `SessionStart` | — | warn in-context if the listener is unreachable, cannot prove it holds this machine's token, or is older than the hooks |
 
 Merged idempotently — re-running the installer never duplicates hooks or clobbers your existing ones.
 
@@ -163,16 +171,19 @@ Each session (a Claude Code session, a Codex thread) keeps its own state in `~/.
 **Why did (or didn't) it notify?** Every hook decision is one line in `~/.cc-notifier/hook.log` on the machine running the agent:
 
 ```
-… done sent act=alarm http=200 curl_exit=0 session=6717398a agent=claude age=612s since=turn_start cwd=proj bg=0 crons=0 title=29c brief=88c
-… done sent act=alarm http=200 curl_exit=0 session=01a10977 agent=codex age=493s since=turn_start cwd=paper bg=0 crons=0 title=30c brief=19c
+… done sent act=alarm http=200 err=ok auth=signed session=6717398a agent=claude age=612s since=turn_start cwd=proj bg=0 crons=0 title=29c brief=88c
+… done sent act=alarm http=200 err=ok auth=signed session=01a10977 agent=codex age=493s since=turn_start cwd=paper bg=0 crons=0 title=30c brief=19c
 … done silent reason=background_tasks session=f4903eb2 agent=claude cwd=proj bg=1 crons=0 bg_tasks=[shell/running:wait for the job] notice_in=300s
-… done sent act=alarm http=200 curl_exit=0 session=f4903eb2 agent=claude paused=300s title=39c brief=96c
+… done sent act=alarm http=200 err=ok auth=signed session=f4903eb2 agent=claude paused=300s title=39c brief=96c
 … done silent reason=quick_turn age=5s min=20s since=turn_start session=4c990e6c agent=claude cwd=proj bg=0 crons=0
-… prompt cancel http=200 curl_exit=0 session=6717398a agent=claude kind=typed turn=started
+… done sent act=alarm http=000 err=unverified auth=- session=77b0c2aa agent=claude age=95s since=turn_start cwd=proj bg=0 crons=0 title=24c brief=61c
+… prompt cancel http=200 err=ok auth=signed session=6717398a agent=claude kind=typed turn=started
 … prompt keep session=f4903eb2 agent=claude kind=task-notification turn=running
 ```
 
-Both ends must be current for all of this: a listener older than the hooks still shows the alarm, but an older one cuts a long message in the phone push or sends only its one-sentence summary, one older still titles every alarm Claude Code and sends no summary to the phone, and the oldest has one shared slot and no title or summary at all (`cc_doctor.sh` and the `SessionStart` check say which).
+`err=` says what kept a request from going out: `unreachable` (no tunnel), `unverified` (something answers on the port but cannot prove it holds the token: the tokens differ, or someone else holds the port), `no_token` (none on this machine), `listener_has_no_token`, `old_listener_proto<N>` (the Mac needs the current installer). `auth=legacy` appears only on a machine upgraded from protocol 5 while its Mac still runs that version (see [Security](#security)).
+
+Both ends must be current: these hooks send only signed requests (protocol 6), which a listener older than that cannot check, so it gets nothing (`cc_doctor.sh` and the `SessionStart` check say so). The one exception is the move from protocol 5, described under [Security](#security).
 
 ## Configuration
 
@@ -239,7 +250,7 @@ Nothing is trimmed, and nothing is published anywhere: the text lives in the cha
 - **If Telegram refuses the formatted text** it is sent again as plain text, and if nothing gets through, a short form (title and one-sentence summary) is sent instead. `~/.cc-notifier/telegram.log` on the Mac records what was sent (sizes and errors, never the text).
 - **A question** (`ask`) carries its choices.
 
-The whole message travels from the agent's machine as the body of a POST, which needs curl 7.87 or newer there; with an older curl the push gets the first 3,400 characters and says how much is left.
+The whole message travels from the agent's machine as the body of a signed POST.
 
 All of this is text from your session. Add `CC_TELEGRAM_BRIEF=0` to the config to keep it on the Mac; the push then carries the last line only.
 
@@ -316,16 +327,21 @@ bash install.sh --uninstall     # removes hooks + launchd; leaves ~/.cc-notifier
 
 ## Security
 
-The listener is loopback-only and never runs as root, but two things are worth knowing:
+The listener is loopback-only and never runs as root. What a shared remote host means for it, and what protects you:
 
-- **Shared remote hosts.** An ssh `RemoteForward` binds the port on the *remote's* loopback, which on a multi-user login node is reachable by **every user on that host** — so another user could trigger or silence your alarms. Enable a shared token to stop that:
+- **Anyone on a shared login node can reach the port.** An ssh `RemoteForward` binds the port on the *remote's* loopback, so every user of that host can send to it. **Every request is therefore signed** with a token both ends share (`~/.cc-notifier/token`, made by the Mac's installer): an HMAC-SHA256 over the method, path, query, body, time and a one-time nonce. The listener carries out a request only when the signature is right, the time is within 5 minutes, and the nonce is new, so a copied request can be neither changed nor sent again. Without a token file the listener refuses everything.
+- **The token never travels.** It is a key, not a password: no request carries it, so whoever sees the traffic cannot reuse it. That matters on a shared host: when the tunnel is down, any user there can listen on the port. So before sending anything a sender asks the listener for a proof (`/ping?c=<random>` must come back with `HMAC(token, challenge)`), and a listener that cannot give one gets nothing, neither the request nor the message. The Mac's tunnel keeper checks the same proof, so it notices when the port on the remote is not leading to your Mac.
+- **Slow or idle connections are cut off.** A connection has 5 seconds for its whole request, and at most 64 are handled at once, so a few connections that send nothing cannot tie the listener up. Anyone on the node can still flood the port, though, and that also loads your ssh connection: the request checks keep the alarms honest, not always on time.
+- **Nothing secret goes on a command line.** Other users of a shared host can read every process's arguments. The token, the Telegram bot token and the message texts reach `curl` and the client through standard input, files or the environment (which only you can read), never as arguments.
+- **Moving the token.** It goes over ssh, on standard input:
   ```bash
-  ~/.cc-notifier/cc_token.sh new            # on your Mac — prints a value
-  ~/.cc-notifier/cc_token.sh set <value>    # on each remote — same value
+  ~/.cc-notifier/cc_token.sh push <host>...     # copy the Mac's token to each remote
+  ~/.cc-notifier/cc_token.sh rotate <host>...   # a new token everywhere at once (refuses if an end is not ready for it)
   ```
-  With a token set, the action endpoints require a matching `X-CC-Token` header (`/ping` stays open). The listener re-reads the token per request, so enabling/disabling it needs no restart.
+  `cc_token.sh set` on a remote reads a token from standard input and refuses one given as an argument.
+- **Private files.** The installer keeps `~/.cc-notifier` readable by you only: the token, the config (with the Telegram bot token) and the message texts on their way to the phone. `cc_doctor.sh` flags anything that is not.
 - **Browser requests.** The listener rejects any request carrying a non-local `Origin` header, blocking CSRF / DNS-rebinding from web pages.
-- **Telegram token** lives in `~/.cc-notifier/config` (it's `chmod 600`) and rides the Telegram API URL — fine on a single-user Mac.
+- **Moving from protocol 5.** The previous version sent the token itself in a header. A remote upgraded from it keeps `legacy-token.sha256`, the hash of the token it had; while the Mac still runs protocol 5, and for at most 72 hours, that remote keeps serving it the old way, with that same token only (never on a command line). Once the Mac's listener has proved itself the file is deleted and the token never leaves the remote again; a new token never matches the file. So: update the Mac (re-run `install.sh` there), then `cc_token.sh rotate <each remote>`.
 
 ## Development
 
@@ -337,11 +353,13 @@ src/receiver/             listener, alarms, sound/hotkey helpers (run on the Mac
 src/install.template.sh   the installer framework
 build.sh                  bundles src/ into the self-contained install.sh
 tests/test_hook.py        checks for the per-session decisions and the summary (src/sender/cc_hook.py)
-tests/test_notify.py      local HTTP checks for explicit completion delivery
+tests/test_notify.py      cc_notify.sh against the real listener on a spare port
 tests/test_telegram.py    checks for how a message becomes Telegram messages (src/receiver/cc_telegram.py)
+tests/test_security.py    signatures, replays, proofs, someone else on the port, command lines on both ends, the installer
+tests/_harness.py         the fixtures they share (nothing reaches your real Mac or kit)
 ```
 
-Edit a file under `src/`, run `python3 tests/test_hook.py`, `python3 tests/test_notify.py`, `python3 tests/test_telegram.py`, and `./build.sh`, then commit both the source change and the regenerated `install.sh`.
+Edit a file under `src/`, run `python3 tests/test_hook.py`, `python3 tests/test_notify.py`, `python3 tests/test_telegram.py`, `python3 tests/test_security.py`, and `./build.sh`, then commit both the source change and the regenerated `install.sh`. `CC_TEST_BASH=/path/to/bash-3.2` runs the shell scripts in the tests with the shell macOS uses.
 
 ## License
 

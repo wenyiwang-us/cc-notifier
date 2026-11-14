@@ -22,10 +22,10 @@ if [ -n "$PAYLOAD" ]; then
 fi
 case "$verdict" in
   cancel)
-    HDR=(); [ -f "$DIR/token" ] && HDR=(-H "X-CC-Token: $(cat "$DIR/token")")
-    ( code="$(curl -s --noproxy '*' --max-time 2 "${HDR[@]}" -G --data-urlencode "session=${sid}" -o /dev/null \
-        -w '%{http_code}' "http://localhost:${PORT}/stop" 2>/dev/null)"; ec=$?
-      log "cancel http=${code} curl_exit=${ec} $info" ) >/dev/null 2>&1 &
+    # Signed, like every request (cc_client.py); the session id goes in the environment.
+    ( res="$(CC_F_SESSION="$sid" CC_NOTIFY_TIMEOUT=2 CC_NOTIFY_PORT="$PORT" CC_NOTIFIER_DIR="$DIR" \
+          "$PYBIN" "$HERE/cc_client.py" send stop 2>/dev/null)"
+      log "cancel ${res:-http=000 err=client_failed auth=-} $info" ) >/dev/null 2>&1 &
     ;;
   keep) log "keep $info";;
   # No session to act for: leave every alarm alone rather than cancel someone else's.

@@ -22,28 +22,10 @@ fi
 [ "$verdict" = "notify" ] || { sid=""; title=""; brief=""; agent="$AGENT"; label=""; body=""; short=""; info="helper-unavailable"; }
 
 [ -n "$label" ] || label="$(hostname -s 2>/dev/null || echo host)/$(basename "$PWD" 2>/dev/null)"
-HDR=(); [ -f "$DIR/token" ] && HDR=(-H "X-CC-Token: $(cat "$DIR/token")")
-F=("label=${label}")
-[ -n "$agent" ] && F+=("agent=${agent}")
-[ -n "$sid" ]   && F+=("session=${sid}")
-[ -n "$title" ] && F+=("title=${title}")
-[ -n "$brief" ] && F+=("brief=${brief}")
-( # The whole message travels as the body of a POST. A listener older than protocol 5
-  # (or a curl without --url-query) gets its opening in the query instead.
-  proto=0
-  if [ -n "$body" ] && [ -s "$body" ] && curl --help all 2>/dev/null | grep -q -- '--url-query'; then
-    proto="$(curl -s --noproxy '*' --max-time 2 "http://localhost:${PORT}/ping" 2>/dev/null)"
-    case "$proto" in *proto=*) proto="${proto##*proto=}"; proto="${proto%%[!0-9]*}";; *) proto=0;; esac
-  fi
-  A=()
-  if [ "${proto:-0}" -ge 5 ]; then
-    for f in "${F[@]}"; do A+=(--url-query "$f"); done
-    A+=(-H "Content-Type: text/plain; charset=utf-8" --data-binary "@${body}")
-  else
-    A=(-G); for f in "${F[@]}"; do A+=(--data-urlencode "$f"); done
-    [ -n "$short" ] && [ -s "$short" ] && A+=(--data-urlencode "body@${short}")
-  fi
-  code="$(curl -s --noproxy '*' --max-time 5 "${HDR[@]}" "${A[@]}" -o /dev/null -w '%{http_code}' \
-    "http://localhost:${PORT}/ask" 2>/dev/null)"; ec=$?
-  log "sent http=${code} curl_exit=${ec} $info" ) >/dev/null 2>&1 &
+# The request goes out through cc_client.py: signed with the token, which never
+# travels, and only to a listener that proves it holds the token. The fields go in
+# the environment, never on a command line (other users of the host can read those).
+( res="$(CC_F_LABEL="$label" CC_F_AGENT="$agent" CC_F_SESSION="$sid" CC_F_TITLE="$title" CC_F_BRIEF="$brief" \
+      CC_F_BODY_FILE="$body" CC_NOTIFY_PORT="$PORT" CC_NOTIFIER_DIR="$DIR" "$PYBIN" "$HERE/cc_client.py" send ask 2>/dev/null)"
+  log "sent ${res:-http=000 err=client_failed auth=-} $info" ) >/dev/null 2>&1 &
 exit 0

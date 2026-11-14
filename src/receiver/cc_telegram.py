@@ -14,12 +14,15 @@ messages, in order. To keep the chat short, a long body shows its opening and
 folds the rest into an expandable quote: tap it to read on. Nothing is hosted
 anywhere; the text lives in the chat and nowhere else.
 
-The HTTPS call is curl's, as everywhere else in this kit. Exit status 0 when the
-first message was accepted; the caller sends its short form otherwise.
+The HTTPS call is curl's, as everywhere else in this kit. The bot token is part of
+the URL, so curl reads the URL from its standard input (a config), never from its
+command line, which any local user can list. Exit status 0 when the first message
+was accepted; the caller sends its short form otherwise.
 """
 import html
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -92,17 +95,26 @@ def render(part, as_html):
     return text
 
 
+def curl_config(options):
+    """[(option, value)] -> a curl config file (curl --config -), values quoted."""
+    q = lambda v: '"%s"' % v.replace("\\", "\\\\").replace('"', '\\"')
+    return "".join("%s = %s\n" % (name, q(value)) for name, value in options).encode("utf-8")
+
+
 def send(token, chat, text, as_html):
     """-> Telegram's answer as a dict ({} when there was none)."""
+    if not (re.match(r"[0-9A-Za-z:_-]+\Z", token) and re.match(r"[0-9A-Za-z@_-]+\Z", chat)):
+        return {"description": "CC_TELEGRAM_TOKEN or CC_TELEGRAM_CHAT_ID has an unexpected character"}
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as f:
         f.write(text)
-    args = ["curl", "-s", "--max-time", "15", "https://api.telegram.org/bot%s/sendMessage" % token,
-            "--data-urlencode", "chat_id=" + chat, "--data-urlencode", "text@" + f.name,
-            "--data-urlencode", "disable_web_page_preview=true"]
+    options = [("url", "https://api.telegram.org/bot%s/sendMessage" % token),
+               ("data-urlencode", "chat_id=" + chat), ("data-urlencode", "text@" + f.name),
+               ("data-urlencode", "disable_web_page_preview=true")]
     if as_html:
-        args += ["--data-urlencode", "parse_mode=HTML"]
+        options.append(("data-urlencode", "parse_mode=HTML"))
     try:
-        p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        p = subprocess.run(["curl", "-s", "--max-time", "15", "--config", "-"], input=curl_config(options),
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         return json.loads(p.stdout.decode("utf-8", "replace"))
     except Exception:
         return {}

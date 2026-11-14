@@ -15,6 +15,7 @@
 #                   and on questions (AskUserQuestion). Codex uses the same hook
 #                   scripts once switched on (--codex, or cc_codex_hooks.sh on).
 set -euo pipefail
+umask 077          # the kit holds the token, the config (Telegram bot token) and message texts
 
 PORT=28765
 DIR="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"
@@ -43,8 +44,316 @@ esac
 log(){ printf '  %s\n' "$*"; }
 hdr(){ printf '\n== %s ==\n' "$*"; }
 
+# An earlier kit (protocol 5 or older) sent the token itself. Seen before the new
+# files are written: a token, but no cc_client.py yet.
+FROM_OLD=0
+[ -s "$DIR/token" ] && [ ! -f "$DIR/cc_client.py" ] && FROM_OLD=1
+
+secure_files(){
+  chmod 700 "$DIR"
+  local f
+  for f in token config legacy-token.sha256; do [ -f "$DIR/$f" ] && chmod 600 "$DIR/$f"; done
+  for f in sessions tmp; do [ -d "$DIR/$f" ] && chmod 700 "$DIR/$f"; done
+  return 0
+}
+
 write_sender(){
   mkdir -p "$DIR"
+  cat > "$DIR/cc_client.py" <<'CCN_EOF_cc_client_py'
+#!/usr/bin/env python3
+"""The one HTTP client of cc-notifier: every script, on either end, sends through it.
+
+Protocol 6. The shared token (<dir>/token, the same value on the Mac and on each
+remote) is a key, and the key never travels:
+
+  * Every request carries X-CC-Time, X-CC-Nonce and X-CC-Sig: an HMAC-SHA256,
+    under the token, of the method, path, query, a hash of the body, the time and
+    the nonce. The listener takes a request once, and only within WINDOW seconds
+    of its time, so a copy of one can be neither changed nor sent again.
+  * Before anything goes out, /ping?c=<challenge> has to answer with
+    proof=HMAC(token, challenge), which only a listener holding the token can
+    give. On a shared login node a dropped tunnel leaves the port free, and any
+    user there can listen on it; such a listener gets nothing from us.
+  * Nothing secret, and no message text, goes on a command line: any user of a
+    shared host can list those. The fields come in the environment, which only
+    the same user can read.
+
+Moving from protocol 5. A listener of protocol 5 (the version before this one)
+takes the token itself, in a header. A machine upgraded from that version keeps
+<dir>/legacy-token.sha256, the hash of the token it had then; while that file
+names the current token, and for LEGACY_HOURS after it was written, this client
+still serves a protocol-5 listener that way (in a header, never on a command
+line). The first time a protocol-6 listener proves itself the file is deleted,
+and from then on the token never leaves this machine. A new token never matches
+the file, so a new token never travels.
+
+usage:
+  cc_client.py send <alarm|done|ask|beep|stop>
+      fields from the environment: CC_F_LABEL, CC_F_AGENT, CC_F_SESSION,
+      CC_F_TITLE, CC_F_BRIEF, and the text for the phone push in the file
+      CC_F_BODY_FILE (or in CC_F_BODY). `stop` without CC_F_SESSION silences
+      every alarm. Prints "http=<code> err=<reason> auth=<signed|legacy|->";
+      exit 0 when the listener answered 200.
+  cc_client.py ping       prints what the listener says; exit 0 when it proved itself
+  cc_client.py challenge  prints a fresh challenge (cc_tunnel_keep.sh on the Mac)
+  cc_client.py verify <challenge>
+      reads a /ping answer on stdin; exit 0 when its proof is right for <challenge>
+Environment: CC_NOTIFIER_DIR (default ~/.cc-notifier), CC_NOTIFY_PORT (28765),
+CC_NOTIFY_TIMEOUT (seconds per request, default 5; a ping waits at most 2). Each
+call has an overall limit too, so a listener that answers slowly cannot hold it.
+"""
+import hashlib
+import hmac
+import http.client
+import os
+import re
+import secrets
+import signal
+import socket
+import sys
+import time
+from urllib.parse import quote, urlencode
+
+PROTO = 6
+PORT = int(os.environ.get("CC_NOTIFY_PORT") or "28765")
+DIR = os.environ.get("CC_NOTIFIER_DIR") or os.path.join(os.path.expanduser("~"), ".cc-notifier")
+LEGACY = "legacy-token.sha256"
+LEGACY_HOURS = 72           # the move from protocol 5 must be finished by then
+MAX_POST = 1 << 20          # the listener refuses a longer body
+ACTS = ("alarm", "done", "ask", "beep", "stop")
+FIELDS = (("label", "CC_F_LABEL"), ("agent", "CC_F_AGENT"), ("session", "CC_F_SESSION"),
+          ("title", "CC_F_TITLE"), ("brief", "CC_F_BRIEF"))
+CHALLENGE = re.compile(r"[0-9a-f]{32}\Z")
+
+
+# --- the protocol (cc_alarm_listener.py holds the same three functions) ------
+
+def request_sig(key, method, path, query, body, t, nonce):
+    msg = "cc-notifier/6 req\n%s\n%s\n%s\n%s\n%d\n%s" % (
+        method, path, query, hashlib.sha256(body).hexdigest(), t, nonce)
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def ping_proof(key, challenge):
+    return hmac.new(key, ("cc-notifier/6 pong\n" + challenge).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def same(a, b):
+    """Constant-time comparison of two strings of any content."""
+    return hmac.compare_digest(str(a).encode("utf-8", "replace"), str(b).encode("utf-8", "replace"))
+
+
+# --- this machine's side -----------------------------------------------------
+
+def token_key():
+    """The shared token as bytes, b"" when there is none."""
+    try:
+        with open(os.path.join(DIR, "token"), "rb") as f:
+            return f.read().strip()
+    except OSError:
+        return b""
+
+
+def legacy_until():
+    """When the move from protocol 5 ends (epoch seconds), 0 when there is none."""
+    try:
+        return os.stat(os.path.join(DIR, LEGACY)).st_mtime + LEGACY_HOURS * 3600
+    except OSError:
+        return 0
+
+
+def legacy_allowed(key):
+    """May a protocol-5 listener still be sent this token (see the module notes)?"""
+    if time.time() > legacy_until():
+        return False
+    try:
+        with open(os.path.join(DIR, LEGACY)) as f:
+            recorded = f.read().strip()
+    except OSError:
+        return False
+    return bool(key) and same(recorded, hashlib.sha256(key).hexdigest())
+
+
+def drop_legacy():
+    try:
+        os.unlink(os.path.join(DIR, LEGACY))
+    except OSError:
+        pass
+
+
+def parse_ping(text):
+    """'ok proto=6 proof=...' -> {'proto': 6, 'proof': '...', ...}"""
+    out = {}
+    for word in (text or "").split():
+        name, sep, value = word.partition("=")
+        if sep:
+            out[name] = value
+    m = re.match(r"[0-9]{1,4}", out.get("proto", ""))
+    out["proto"] = int(m.group(0)) if m else 0
+    return out
+
+
+def addresses():
+    """The loopback addresses `localhost` stands for here, in the system's order."""
+    found = []
+    try:
+        for info in socket.getaddrinfo("localhost", PORT, 0, socket.SOCK_STREAM):
+            if info[4][0] not in found:
+                found.append(info[4][0])
+    except OSError:
+        pass
+    return found or ["127.0.0.1"]
+
+
+def exchange(addr, method, target, body=None, headers=None, timeout=5.0):
+    """One request to addr:PORT. -> (status, the first 4 kB of the answer)"""
+    conn = http.client.HTTPConnection(addr, PORT, timeout=timeout)
+    try:
+        conn.request(method, target, body=body, headers=headers or {})
+        r = conn.getresponse()
+        return r.status, r.read(4096).decode("utf-8", "replace")
+    finally:
+        conn.close()
+
+
+def ping(timeout=2.0):
+    """Ask each loopback address for a proof. -> dict (proto, verified, addr, ...)
+    for the first listener that proves itself, else for the first one that
+    answered at all; None when nothing answers."""
+    key = token_key()
+    first = None
+    for addr in addresses():
+        challenge = secrets.token_hex(16)
+        try:
+            status, text = exchange(addr, "GET", "/ping?c=" + challenge, timeout=timeout)
+        except (OSError, http.client.HTTPException):
+            continue
+        if status != 200:
+            continue
+        info = parse_ping(text)
+        info["addr"] = addr
+        info["verified"] = bool(key) and info["proto"] >= PROTO and same(info.get("proof", ""), ping_proof(key, challenge))
+        if info["verified"]:
+            return info
+        if first is None:
+            first = info
+    return first
+
+
+def send(act, fields, body=b"", timeout=5.0):
+    """-> (HTTP status or 0, reason, how it was authenticated)"""
+    key = token_key()
+    if not key:
+        return 0, "no_token", "-"
+    info = ping(min(timeout, 2.0))
+    if info is None:
+        return 0, "unreachable", "-"
+    path = "/" + act
+    query = urlencode([(name, value) for name, value in fields if value], quote_via=quote)
+    headers = {"Content-Type": "text/plain; charset=utf-8"}
+    if info["verified"]:
+        drop_legacy()
+        t, nonce = int(time.time()), secrets.token_hex(16)
+        headers.update({"X-CC-Time": str(t), "X-CC-Nonce": nonce,
+                        "X-CC-Sig": request_sig(key, "POST", path, query, body, t, nonce)})
+        auth = "signed"
+    elif info["proto"] == 5 and legacy_allowed(key):
+        headers["X-CC-Token"] = key.decode("utf-8", "replace")
+        auth = "legacy"
+    elif info["proto"] >= PROTO and info.get("auth") == "none":
+        return 0, "listener_has_no_token", "-"
+    elif info["proto"] >= PROTO:
+        # It answers like a listener but cannot prove it holds our token: the two
+        # ends have different tokens, or someone else holds the port here.
+        return 0, "unverified", "-"
+    else:
+        return 0, "old_listener_proto%d" % info["proto"], "-"
+    try:
+        status, _ = exchange(info["addr"], "POST", path + ("?" + query if query else ""),
+                             body=body, headers=headers, timeout=timeout)
+    except socket.timeout:
+        return 0, "timeout", auth
+    except (OSError, http.client.HTTPException):
+        return 0, "unreachable", auth
+    return status, "ok" if status == 200 else "http_%d" % status, auth
+
+
+class OutOfTime(Exception):
+    pass
+
+
+def _out_of_time(*_):
+    raise OutOfTime()
+
+
+def main(argv):
+    os.umask(0o077)
+    cmd = argv[1] if len(argv) > 1 else ""
+    try:
+        timeout = min(max(float(os.environ.get("CC_NOTIFY_TIMEOUT") or 5), 0.5), 30.0)
+    except ValueError:
+        timeout = 5.0
+    # The socket timeouts bound each step; this bounds the whole call (a listener
+    # that trickles its answer byte by byte could otherwise hold it much longer).
+    ping_budget = 2 * min(timeout, 2.0)                  # up to two loopback addresses
+    budget = {"send": ping_budget + timeout + 1, "ping": ping_budget + 1}.get(cmd, 3)
+    signal.signal(signal.SIGALRM, _out_of_time)
+    signal.setitimer(signal.ITIMER_REAL, budget)
+    try:
+        return run(cmd, argv, timeout)
+    except OutOfTime:
+        print("http=000 err=timeout auth=-" if cmd == "send" else "unreachable (timed out)")
+        return 1
+
+
+def run(cmd, argv, timeout):
+    if cmd == "send" and len(argv) == 3 and argv[2] in ACTS:
+        body = b""
+        if os.environ.get("CC_F_BODY_FILE"):
+            try:
+                with open(os.environ["CC_F_BODY_FILE"], "rb") as f:
+                    body = f.read(MAX_POST)
+            except OSError:
+                body = b""
+        elif os.environ.get("CC_F_BODY"):
+            body = os.environ["CC_F_BODY"].encode("utf-8", "replace")[:MAX_POST]
+        fields = [(name, os.environ.get(var, "")) for name, var in FIELDS]
+        status, why, auth = send(argv[2], fields, body, timeout)
+        print("http=%03d err=%s auth=%s" % (status, why, auth))
+        return 0 if status == 200 else 1
+    if cmd == "ping" and len(argv) == 2:
+        info = ping(min(timeout, 2.0))
+        if info is None:
+            print("unreachable")
+            return 1
+        notes = ""
+        if not info["verified"]:
+            if not token_key():
+                notes = " token=none"
+            elif info["proto"] == 5 and legacy_allowed(token_key()):
+                notes = " legacy=yes until=" + time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(legacy_until()))
+            elif info["proto"] == 5 and legacy_until():
+                notes = " legacy=expired"
+        if info.get("auth"):
+            notes += " listener_auth=" + info["auth"]
+        print("proto=%d verified=%s%s" % (info["proto"], "yes" if info["verified"] else "no", notes))
+        return 0 if info["verified"] else 1
+    if cmd == "challenge" and len(argv) == 2:
+        print(secrets.token_hex(16))
+        return 0
+    if cmd == "verify" and len(argv) == 3:
+        key, challenge = token_key(), argv[2]
+        info = parse_ping(sys.stdin.read(4096))
+        ok = bool(key) and bool(CHALLENGE.match(challenge)) and info["proto"] >= PROTO \
+            and same(info.get("proof", ""), ping_proof(key, challenge))
+        return 0 if ok else 1
+    sys.stderr.write(__doc__[__doc__.index("usage:"):])
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+CCN_EOF_cc_client_py
   cat > "$DIR/cc_codex_hooks.sh" <<'CCN_EOF_cc_codex_hooks_sh'
 #!/bin/bash
 # Turn round-end notifications for Codex on or off. Usage: cc_codex_hooks.sh [on|off|status]
@@ -132,8 +441,12 @@ ok(){   printf "  ${g}OK${z}  %s\n" "$*"; }
 bad(){  printf "  ${r}XX${z}  %s\n" "$*"; }
 warn(){ printf "  ${y}??${z}  %s\n" "$*"; }
 note(){ printf "  ..  %s\n" "$*"; }
-HDR=(); [ -f "$DIR/token" ] && HDR=(-H "X-CC-Token: $(cat "$DIR/token")")
+HERE="$(cd "$(dirname "$0")" && pwd)"
+PYBIN="$(command -v python3 || echo /usr/bin/python3)"
 hc(){ curl -s --noproxy '*' --max-time 4 -o /dev/null -w '%{http_code}' "$@" 2>/dev/null; }
+# Asks the listener to prove it holds this machine's token; sends nothing else and
+# rings nothing. The token never travels and never appears on a command line.
+ping_out="$(CC_NOTIFY_PORT="$PORT" CC_NOTIFIER_DIR="$DIR" "$PYBIN" "$HERE/cc_client.py" ping 2>/dev/null)"
 
 printf "cc-notifier doctor — %s (%s)\n" "$(uname -n)" "$OS"
 
@@ -145,30 +458,28 @@ else bad "listener NOT reachable (HTTP ${code:-none})"
   else note "fix (tunnel down): from your Mac  ssh -O forward -R ${PORT}:localhost:${PORT} <host>"; fi
 fi
 
-# --- listener version + hook helper (per-session alarms, session title, brief) ---
+# --- listener version + auth (signed requests; the listener proves it holds the token) ---
 if [ "$code" = 200 ]; then
-  body="$(curl -s --noproxy '*' --max-time 4 "http://localhost:${PORT}/ping" 2>/dev/null)"
-  proto=1; case "$body" in *proto=*) proto="${body##*proto=}"; proto="${proto%%[!0-9]*}";; esac
-  if   [ "${proto:-1}" -ge 5 ]; then ok "listener is current (protocol ${proto}): one alarm per session, agent name, summary in the alert, the whole message in the phone push"
-  elif [ "${proto:-1}" -ge 4 ]; then warn "listener is one version behind these hooks (protocol ${proto}, need 5): the phone push stops at 3,500 characters — re-run install.sh on the Mac"
-  elif [ "${proto:-1}" -ge 3 ]; then warn "listener is behind these hooks (protocol ${proto}, need 5): the phone push carries only the one-sentence summary — re-run install.sh on the Mac"
-  elif [ "${proto:-1}" -ge 2 ]; then warn "listener is behind these hooks (protocol ${proto}, need 5): no summary in the phone push, every alarm titled Claude Code — re-run install.sh on the Mac"
-  else warn "listener is older than these hooks (protocol ${proto:-1}, need 5): one shared alarm, no title/summary — re-run install.sh on the Mac"; fi
+  case "$ping_out" in
+    proto=*\ verified=yes*) ok "listener is current and holds this machine's token (${ping_out%% *}): requests are signed, the token never travels";;
+    *legacy=yes*) warn "listener is protocol 5: it still gets the old token in a header — re-run install.sh on the Mac, then there: cc_token.sh rotate <this host>";;
+    *token=none*) bad "no token on this machine ($DIR/token): nothing is sent — on the Mac: cc_token.sh push <this host>";;
+    *listener_auth=none*) bad "the listener has no token, so it refuses everything — on the Mac: cc_token.sh new, then cc_token.sh push <each remote>";;
+    proto=[0-5]\ *) bad "listener is older than these hooks (${ping_out%% *}, need 6: signed requests), so nothing is sent to it — re-run install.sh on the Mac";;
+    *) bad "the listener cannot prove it holds this machine's token (${ping_out:-no answer}): the tokens differ (on the Mac: cc_token.sh push <this host>) or someone else holds port ${PORT} here — nothing is sent to it";;
+  esac
 fi
-PYBIN="$(command -v python3 || echo /usr/bin/python3)"
 [ "$("$PYBIN" "$DIR/cc_hook.py" check 2>/dev/null)" = "ok" ] && ok "hook helper runs ($PYBIN cc_hook.py)" \
   || bad "hook helper cannot run ($PYBIN $DIR/cc_hook.py) — hooks fall back to always notifying, no brief"
 n="$(find "$DIR/sessions" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
 note "per-session state: ${n} session(s) in $DIR/sessions; decisions are logged in $DIR/hook.log"
 
-# --- auth ---
-if [ -f "$DIR/token" ]; then
-  sc="$(hc "${HDR[@]}" "http://localhost:${PORT}/stop")"
-  [ "$sc" = 200 ] && ok "auth token accepted by listener" \
-                  || warn "token present but listener returned ${sc} — tokens differ between ends? (cc_token.sh)"
-else
-  warn "auth OFF (no $DIR/token). On a shared host others can reach the port. Enable: cc_token.sh new"
-fi
+# --- private files: the token, the config (Telegram bot token), the message texts ---
+for f in "$DIR" "$DIR/token" "$DIR/config" "$DIR/sessions" "$DIR/tmp"; do
+  [ -e "$f" ] || continue
+  m="$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null)"
+  case "$m" in 700|600|500|400) ;; *) bad "$f is readable by others (mode $m) — chmod go= $f";; esac
+done
 
 # --- arm + hooks ---
 [ -f "$DIR/armed" ] && note "armed (long alarm)" || note "disarmed (short chime)"
@@ -197,8 +508,9 @@ if [ "$OS" = Darwin ]; then
                                                    || warn "launchd agent not loaded (launchctl load …com.ccnotifier.listener.plist)"
   ( [ -f "$DIR/config" ] && . "$DIR/config"
     if [ -n "${CC_TELEGRAM_TOKEN:-}" ] && [ -n "${CC_TELEGRAM_CHAT_ID:-}" ]; then
-      curl -s --max-time 6 "https://api.telegram.org/bot${CC_TELEGRAM_TOKEN}/getMe" | grep -q '"ok":true' \
-        && ok "Telegram bot reachable + token valid" || warn "Telegram configured but getMe failed (token/network)"
+      # The bot token is part of the URL: curl reads it on stdin, not from its command line.
+      printf 'url = "https://api.telegram.org/bot%s/getMe"\n' "$CC_TELEGRAM_TOKEN" | curl -s --max-time 6 --config - \
+        | grep -q '"ok":true' && ok "Telegram bot reachable + token valid" || warn "Telegram configured but getMe failed (token/network)"
     else note "Telegram push not configured (optional)"; fi )
   note "alerter notification permission + Focus allow-list can't be checked here — verify by running: $DIR/cc_tunnel_test.sh alarm"
 else
@@ -855,13 +1167,16 @@ set -euo pipefail
 usage(){
   cat <<'USAGE'
 Usage: cc_notify.sh [--title TEXT] [--session ID] [--action auto|alarm|beep|ask]
-                    [--agent NAME] [--label TEXT] [--body TEXT] [--message TEXT] [MESSAGE]
+                    [--agent NAME] [--label TEXT] [--body TEXT | --body-file FILE]
+                    [--message TEXT] [MESSAGE]
 
 Sends one notification and waits for the listener's HTTP response.
 The default action honors cc_notify_arm.sh: alarm when armed, beep otherwise.
 Alarm/ask display the title and message; beep plays the short chime only.
 MESSAGE is the one-sentence summary shown in the alert and the phone push.
---body adds a longer text (line breaks kept) that only the phone push carries.
+--body adds a longer text (line breaks kept) that only the phone push carries;
+--body-file reads it from FILE (- = standard input). Text given as an argument
+can be read by other users of a shared host while this runs; a file cannot.
 --agent names who is notifying (default: Codex or Claude Code when run by one).
 Exit status: 0 = listener accepted it, 1 = delivery failed, 2 = invalid arguments.
 USAGE
@@ -870,12 +1185,14 @@ fail_usage(){ printf '%s\n' "$*" >&2; usage >&2; exit 2; }
 
 DIR="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"
 PORT="${CC_NOTIFY_PORT:-28765}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 LOG="${CC_NOTIFY_LOG:-$DIR/hook.log}"
 ARM_FLAG="${CC_NOTIFY_ARM_FLAG:-$DIR/armed}"
 act="auto"
 title="Work complete"
 sid="${CODEX_THREAD_ID:-manual}"
 body=""
+body_file=""
 agent="${CC_NOTIFY_AGENT:-}"
 if [ -z "$agent" ]; then
   if [ -n "${CODEX_THREAD_ID:-}" ]; then agent="Codex"; elif [ -n "${CLAUDECODE:-}" ]; then agent="Claude Code"; fi
@@ -885,7 +1202,7 @@ message=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0;;
-    --title|--session|--action|--agent|--label|--body|--message)
+    --title|--session|--action|--agent|--label|--body|--body-file|--message)
       [ $# -ge 2 ] || fail_usage "Missing value for $1."
       case "$1" in
         --title) title="$2";;
@@ -893,6 +1210,7 @@ while [ $# -gt 0 ]; do
         --action) act="$2";;
         --agent) agent="$2";;
         --body) body="$2";;
+        --body-file) body_file="$2";;
         --label) label="$2";;
         --message) message="$2";;
       esac
@@ -903,6 +1221,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$message" ] || fail_usage "A completion message is required."
+if [ "$body_file" = "-" ]; then
+  # Standard input goes to a private file first (the client reads the body from a file).
+  tmp_body="$(umask 077; mktemp "${TMPDIR:-/tmp}/cc_notify.XXXXXX")" || { echo "cannot make a temporary file" >&2; exit 1; }
+  trap 'rm -f "$tmp_body"' EXIT
+  cat > "$tmp_body"; body_file="$tmp_body"
+elif [ -n "$body_file" ] && [ ! -r "$body_file" ]; then
+  fail_usage "Cannot read $body_file."
+fi
 case "$act" in
   auto) if [ -f "$ARM_FLAG" ]; then act="alarm"; else act="beep"; fi;;
   alarm|beep|ask) ;;
@@ -910,97 +1236,172 @@ case "$act" in
 esac
 
 log(){
-  ( umask 077; printf '%s manual act=%s http=%s curl_exit=%s session=%s\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$act" "$code" "$ec" "$sid" >> "$LOG" ) 2>/dev/null || :
+  ( umask 077; printf '%s manual act=%s %s session=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$act" "$res" "$sid" >> "$LOG" ) 2>/dev/null || :
 }
-# Read the auth header through stdin so the token is absent from process args.
-header=""
-if [ -f "$DIR/token" ]; then header="X-CC-Token: $(cat "$DIR/token")"; fi
-# Localhost must reach the SSH tunnel directly even when proxy variables are set.
-if code="$(printf '%s\n' "$header" | curl --silent --show-error \
-    --noproxy '*' --max-time "${CC_NOTIFY_TIMEOUT:-5}" --header @- \
-    --get --data-urlencode "label=$label" --data-urlencode "session=$sid" \
-    ${agent:+--data-urlencode "agent=$agent"} ${body:+--data-urlencode "body=$body"} \
-    --data-urlencode "title=$title" --data-urlencode "brief=$message" \
-    --output /dev/null --write-out '%{http_code}' "http://localhost:${PORT}/${act}")"; then
-  ec=0
-else
-  ec=$?
-fi
+# Signed with the token, which never travels, and sent only to a listener that
+# proves it holds the token (cc_client.py). The fields go in the environment,
+# never on a command line. Localhost is reached directly, whatever the proxy settings.
+PYBIN="$(command -v python3 || echo /usr/bin/python3)"
+res="$(CC_F_LABEL="$label" CC_F_SESSION="$sid" CC_F_AGENT="$agent" CC_F_TITLE="$title" CC_F_BRIEF="$message" \
+       CC_F_BODY="$body" CC_F_BODY_FILE="$body_file" CC_NOTIFY_PORT="$PORT" CC_NOTIFIER_DIR="$DIR" \
+       "$PYBIN" "$HERE/cc_client.py" send "$act" 2>/dev/null)" || :
+[ -n "$res" ] || res="http=000 err=client_failed auth=-"
 log
-if [ "$ec" -eq 0 ] && [ "$code" = 200 ]; then
-  printf 'OK /%s -> HTTP 200 (listener accepted notification)\n' "$act"
-  exit 0
-fi
-printf 'FAIL /%s -> HTTP=%s curl_exit=%s\n' "$act" "${code:-none}" "$ec" >&2
-if [ "$code" = 403 ]; then
-  printf 'Auth token mismatch; synchronize %s/token with the Mac.\n' "$DIR" >&2
-else
-  printf 'Check the listener/tunnel with %s/cc_tunnel_test.sh ping.\n' "$DIR" >&2
-fi
+case "$res" in
+  http=200\ *) printf 'OK /%s -> HTTP 200 (listener accepted notification)\n' "$act"; exit 0;;
+esac
+printf 'FAIL /%s -> %s\n' "$act" "$res" >&2
+case "$res" in
+  *err=no_token*) printf 'No token in %s: on the Mac, run  ~/.cc-notifier/cc_token.sh push <this host>\n' "$DIR" >&2;;
+  *err=unverified*|*http=401*|*http=403*)
+    printf 'The listener did not take our signature: the two ends have different tokens (on the Mac: cc_token.sh push <this host>), or someone else holds port %s here.\n' "$PORT" >&2;;
+  *err=old_listener*) printf 'The listener on the Mac is older than these hooks: re-run install.sh on the Mac.\n' >&2;;
+  *) printf 'Check the listener/tunnel with %s/cc_tunnel_test.sh ping.\n' "$DIR" >&2;;
+esac
 exit 1
 CCN_EOF_cc_notify_sh
   cat > "$DIR/cc_token.sh" <<'CCN_EOF_cc_token_sh'
 #!/bin/bash
-# Manage the shared auth token. The SAME value must exist on the Mac (receiver)
-# and on each remote (sender) at <dir>/token. Without it, anyone who can reach
-# the listener port — including other users on a shared login node — can trigger
-# or silence your alarms.
+# Manage the shared token. The SAME value must be in <dir>/token on the Mac
+# (receiver) and on each remote (sender). It is a key: every request is signed
+# with it and it never travels (cc_client.py). Without it nothing is sent, and a
+# listener without it refuses everything.
 #
-#   cc_token.sh new          generate a random token here, print it (copy to other machines)
-#   cc_token.sh set <value>  set a specific token (use the value printed by `new` on the Mac)
-#   cc_token.sh show         print the current token
-#   cc_token.sh off          remove the token (auth OFF)
+# Nothing here puts the token on a command line, where any user of a shared host
+# could read it (or your shell history keep it): it moves over ssh, on standard input.
+#
+#   cc_token.sh new               a new random token here (then `push` it to the other ends)
+#   cc_token.sh push <host>...    copy this machine's token to each ssh host
+#   cc_token.sh rotate <host>...  on the Mac: a new token, copied to each host, then used here
+#   cc_token.sh set               read a token from standard input (cc_token.sh set < file)
+#   cc_token.sh show              print the token
+#   cc_token.sh off               remove the token: nothing is sent, and a listener here refuses everything
 DIR="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"
 F="$DIR/token"
-mkdir -p "$DIR"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+PYBIN="$(command -v python3 || echo /usr/bin/python3)"
+umask 077
+mkdir -p "$DIR" && chmod 700 "$DIR" 2>/dev/null
+
+# Run on the far end by ssh; its kit is in its own CC_NOTIFIER_DIR or ~/.cc-notifier.
+REMOTE_PUT='umask 077; d="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"; mkdir -p "$d" && cat > "$d/token.tmp" && test -s "$d/token.tmp" && mv -f "$d/token.tmp" "$d/token"'
+REMOTE_HAS_CLIENT='test -f "${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}/cc_client.py"'
+REMOTE_PING='python3 "${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}/cc_client.py" ping'
+
+usage(){ sed -n '9,15s/^# \{0,1\}//p' "$0" >&2; exit 2; }
+new_token(){ head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }        # 64 hex characters
+put(){  # put <file>: standard input becomes <file>, private, all at once
+  cat > "$1.tmp.$$" && [ -s "$1.tmp.$$" ] && chmod 600 "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1" \
+    || { rm -f "$1.tmp.$$"; return 1; }
+}
+push_one(){ ssh "$1" "$REMOTE_PUT" < "$2"; }    # push_one <host> <file>
+local_ok(){  # does the listener here take signed requests made with this token?
+  case "$(CC_NOTIFIER_DIR="$DIR" "$PYBIN" "$HERE/cc_client.py" ping 2>/dev/null)" in
+    proto=*\ verified=yes*) return 0;; *) return 1;;
+  esac
+}
+
 case "${1:-show}" in
   new)
-    t="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-    printf '%s' "$t" > "$F"; chmod 600 "$F"
-    echo "$t"
-    echo "(saved to $F — run 'cc_token.sh set $t' on every other machine)" >&2 ;;
+    new_token | put "$F" || { echo "could not write $F" >&2; exit 1; }
+    echo "new token in $F. The other ends need it too: $0 push <host>..." >&2 ;;
+  push)
+    shift; [ $# -ge 1 ] || usage
+    [ -s "$F" ] || { echo "no token here ($F): make one with '$0 new'" >&2; exit 1; }
+    for h in "$@"; do
+      if push_one "$h" "$F"; then echo "token copied to $h" >&2
+      else echo "could not copy the token to $h" >&2; exit 1; fi
+    done ;;
+  rotate)
+    shift; [ $# -ge 1 ] || usage
+    # A protocol-5 listener here could not check the new token's signatures,
+    # and an old sender on a host would send the new token itself, in the clear.
+    local_ok || { echo "refusing: the listener here does not take signed requests yet. Re-run install.sh on this Mac first." >&2; exit 1; }
+    for h in "$@"; do
+      ssh "$h" "$REMOTE_HAS_CLIENT" || {
+        echo "refusing: $h has no protocol-6 sender (cc_client.py), which would send the new token in the clear. Update cc-notifier there first." >&2; exit 1; }
+    done
+    new_token | put "$F.new" || { echo "could not write $F.new" >&2; exit 1; }
+    for h in "$@"; do
+      push_one "$h" "$F.new" || {
+        rm -f "$F.new"; echo "could not copy the new token to $h; this Mac keeps the old one, so run rotate again" >&2; exit 1; }
+    done
+    mv -f "$F.new" "$F"
+    echo "new token in use here and on: $*" >&2
+    for h in "$@"; do
+      r="$(ssh "$h" "$REMOTE_PING" 2>/dev/null)"
+      case "$r" in
+        proto=*\ verified=yes*) echo "  $h: the listener proves itself to it ($r)" >&2;;
+        *) echo "  $h: token copied, but $h could not verify the listener (${r:-no answer}): is its tunnel down?" >&2;;
+      esac
+    done ;;
   set)
-    [ -n "${2:-}" ] || { echo "usage: $0 set <value>" >&2; exit 1; }
-    printf '%s' "$2" > "$F"; chmod 600 "$F"; echo "token set ($F)" >&2 ;;
+    if [ $# -gt 1 ]; then
+      echo "refusing: a token given on the command line can be read by other users of this host, and stays in your shell history." >&2
+      echo "Pipe it in instead ($0 set < file), or run '$0 set' and paste it. Better: on the Mac, $0 push <this host>." >&2
+      exit 2
+    fi
+    if [ -t 0 ]; then printf 'token (not shown): ' >&2; IFS= read -rs t; echo >&2; else IFS= read -r t; fi
+    case "$t" in
+      ""|*[!A-Za-z0-9._~+/=-]*) echo "that does not look like a token (letters, digits and ._~+/=- only); nothing changed" >&2; exit 1;;
+    esac
+    [ ${#t} -ge 16 ] || { echo "too short for a token; nothing changed" >&2; exit 1; }
+    printf '%s' "$t" | put "$F" && echo "token set ($F)" >&2 ;;
   show)
-    [ -f "$F" ] && cat "$F" || { echo "(no token — auth OFF)" >&2; exit 1; } ;;
+    [ -s "$F" ] && { cat "$F"; echo; } || { echo "(no token: nothing is sent, and a listener here refuses everything)" >&2; exit 1; } ;;
   off)
-    rm -f "$F"; echo "token removed — auth OFF" >&2 ;;
-  *) echo "usage: $0 [new|set <value>|show|off]" >&2; exit 1 ;;
+    rm -f "$F"; echo "token removed: this machine sends nothing, and a listener here refuses everything" >&2 ;;
+  *) usage ;;
 esac
 CCN_EOF_cc_token_sh
   cat > "$DIR/cc_tunnel_test.sh" <<'CCN_EOF_cc_tunnel_test_sh'
 #!/bin/bash
 # Self-test the notifier path. Usage: cc_tunnel_test.sh [ping|beep|alarm|ask|stop]
-# alarm/ask carry a sample session, title and summary, so the banner and the
-# phone push show the full layout a real round would; stop (no session) silences
-# every alarm.
+# ping only asks the listener to prove it holds this machine's token (nothing
+# rings). alarm/ask carry a sample session, title and summary, so the banner and
+# the phone push show the full layout a real round would; stop (no session)
+# silences every alarm. Every request is signed (cc_client.py): the token never
+# travels and never appears on a command line.
 PORT="${CC_NOTIFY_PORT:-28765}"
 DIR="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 ACT="${1:-ping}"
-HDR=(); [ -f "$DIR/token" ] && HDR=(-H "X-CC-Token: $(cat "$DIR/token")")
-Q=()
-case "$ACT" in alarm|done|ask)
-  Q=(-G --data-urlencode "label=$(hostname -s 2>/dev/null || echo host)/test" --data-urlencode "session=cc-tunnel-test"
-     --data-urlencode "title=cc-notifier test" --data-urlencode "brief=This is where the one-sentence summary of the round shows."
-     --data-urlencode "body=This is where the one-sentence summary of the round shows.
+PYBIN="$(command -v python3 || echo /usr/bin/python3)"
+export CC_NOTIFY_PORT="$PORT" CC_NOTIFIER_DIR="$DIR"
+case "$ACT" in
+  ping)
+    out="$("$PYBIN" "$HERE/cc_client.py" ping 2>&1)"; ec=$?;;
+  alarm|done|ask)
+    out="$(CC_F_LABEL="$(hostname -s 2>/dev/null || echo host)/test" CC_F_SESSION="cc-tunnel-test" \
+      CC_F_TITLE="cc-notifier test" CC_F_BRIEF="This is where the one-sentence summary of the round shows." \
+      CC_F_BODY="This is where the one-sentence summary of the round shows.
 
 The phone push goes on with the rest of the final message:
 • lists stay lists
 • tables become lines
 
-up to about 3,000 characters.");;
+and nothing is cut: a long message continues in further Telegram messages." \
+      "$PYBIN" "$HERE/cc_client.py" send "$ACT" 2>&1)"; ec=$?;;
+  beep|stop)
+    out="$("$PYBIN" "$HERE/cc_client.py" send "$ACT" 2>&1)"; ec=$?;;
+  *) echo "usage: $0 [ping|beep|alarm|ask|stop]" >&2; exit 2;;
 esac
-code=$(curl -s --noproxy '*' --max-time 4 -o /dev/null -w "%{http_code}" "${HDR[@]}" "${Q[@]}" "http://localhost:${PORT}/${ACT}"); ec=$?
-if [ "$code" = "200" ]; then echo "OK   /${ACT} -> HTTP 200"; exit 0; fi
-echo "FAIL /${ACT} -> HTTP=${code} curl_exit=${ec}"
-case "$code" in
-  403) echo "  rejected: auth token missing/mismatch. Sync $DIR/token with the Mac (cc_token.sh).";;
-esac
-case "$ec" in
-  7|56) echo "  reachable on this host but not delivering. If REMOTE, from your Mac: ssh -O cancel -R ${PORT}:localhost:${PORT} <host>; ssh -O forward -R ${PORT}:localhost:${PORT} <host>";;
-  28)   echo "  no forward/tunnel. If REMOTE, from your Mac: ssh -O forward -R ${PORT}:localhost:${PORT} <host>";;
+if [ "$ec" = 0 ]; then echo "OK   /${ACT} -> ${out}"; exit 0; fi
+echo "FAIL /${ACT} -> ${out}"
+case "$out" in
+  unreachable*|*err=unreachable*|*err=timeout*)
+    echo "  nothing answers on localhost:${PORT}. If this is a REMOTE machine, from your Mac: ssh -O cancel -R ${PORT}:localhost:${PORT} <host>; ssh -O forward -R ${PORT}:localhost:${PORT} <host>";;
+  *token=none*|*err=no_token*)
+    echo "  no token on this machine ($DIR/token). On your Mac: ~/.cc-notifier/cc_token.sh push <ssh alias of this machine>";;
+  *listener_auth=none*|*err=listener_has_no_token*)
+    echo "  the listener has no token, so it refuses everything. On your Mac: ~/.cc-notifier/cc_token.sh new, then cc_token.sh push <this machine>";;
+  *legacy=yes*)
+    echo "  the Mac listener is protocol 5: notifications still work, with the old token in a header. Update the Mac (re-run install.sh there), then on the Mac: ~/.cc-notifier/cc_token.sh rotate <this machine>";;
+  *verified=no*|*err=unverified*|*http=401*|*http=403*)
+    echo "  something answers on localhost:${PORT} but cannot prove it holds this machine's token: the two ends have different tokens (on your Mac: cc_token.sh push <this machine>), or someone else holds the port on this host. Nothing is sent to it.";;
+  *err=old_listener*)
+    echo "  the listener is older than these hooks (it cannot check signed requests): re-run install.sh on the Mac.";;
 esac
 exit 1
 CCN_EOF_cc_tunnel_test_sh
@@ -1029,30 +1430,12 @@ fi
 [ "$verdict" = "notify" ] || { sid=""; title=""; brief=""; agent="$AGENT"; label=""; body=""; short=""; info="helper-unavailable"; }
 
 [ -n "$label" ] || label="$(hostname -s 2>/dev/null || echo host)/$(basename "$PWD" 2>/dev/null)"
-HDR=(); [ -f "$DIR/token" ] && HDR=(-H "X-CC-Token: $(cat "$DIR/token")")
-F=("label=${label}")
-[ -n "$agent" ] && F+=("agent=${agent}")
-[ -n "$sid" ]   && F+=("session=${sid}")
-[ -n "$title" ] && F+=("title=${title}")
-[ -n "$brief" ] && F+=("brief=${brief}")
-( # The whole message travels as the body of a POST. A listener older than protocol 5
-  # (or a curl without --url-query) gets its opening in the query instead.
-  proto=0
-  if [ -n "$body" ] && [ -s "$body" ] && curl --help all 2>/dev/null | grep -q -- '--url-query'; then
-    proto="$(curl -s --noproxy '*' --max-time 2 "http://localhost:${PORT}/ping" 2>/dev/null)"
-    case "$proto" in *proto=*) proto="${proto##*proto=}"; proto="${proto%%[!0-9]*}";; *) proto=0;; esac
-  fi
-  A=()
-  if [ "${proto:-0}" -ge 5 ]; then
-    for f in "${F[@]}"; do A+=(--url-query "$f"); done
-    A+=(-H "Content-Type: text/plain; charset=utf-8" --data-binary "@${body}")
-  else
-    A=(-G); for f in "${F[@]}"; do A+=(--data-urlencode "$f"); done
-    [ -n "$short" ] && [ -s "$short" ] && A+=(--data-urlencode "body@${short}")
-  fi
-  code="$(curl -s --noproxy '*' --max-time 5 "${HDR[@]}" "${A[@]}" -o /dev/null -w '%{http_code}' \
-    "http://localhost:${PORT}/ask" 2>/dev/null)"; ec=$?
-  log "sent http=${code} curl_exit=${ec} $info" ) >/dev/null 2>&1 &
+# The request goes out through cc_client.py: signed with the token, which never
+# travels, and only to a listener that proves it holds the token. The fields go in
+# the environment, never on a command line (other users of the host can read those).
+( res="$(CC_F_LABEL="$label" CC_F_AGENT="$agent" CC_F_SESSION="$sid" CC_F_TITLE="$title" CC_F_BRIEF="$brief" \
+      CC_F_BODY_FILE="$body" CC_NOTIFY_PORT="$PORT" CC_NOTIFIER_DIR="$DIR" "$PYBIN" "$HERE/cc_client.py" send ask 2>/dev/null)"
+  log "sent ${res:-http=000 err=client_failed auth=-} $info" ) >/dev/null 2>&1 &
 exit 0
 CCN_EOF_notify_ask_sh
   cat > "$DIR/notify_done.sh" <<'CCN_EOF_notify_done_sh'
@@ -1079,7 +1462,7 @@ CCN_EOF_notify_ask_sh
 # The request names the session (the listener keeps one alarm per session) and
 # carries the agent, the session title, a one-sentence summary (the sentence the
 # final message opens with) for the alert, and the message itself as plain text,
-# whole, for the phone push.
+# whole, for the phone push. It is signed (cc_client.py); the token never travels.
 # Falls back to notifying if the payload/helper is unavailable (never over-suppresses).
 PORT="${CC_NOTIFY_PORT:-28765}"
 DIR="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"
@@ -1117,60 +1500,43 @@ else
 fi
 
 [ -n "$label" ] || label="$(hostname -s 2>/dev/null || echo host)/$(basename "$PWD" 2>/dev/null)"
-HDR=(); [ -f "$DIR/token" ] && HDR=(-H "X-CC-Token: $(cat "$DIR/token")")
-F=("label=${label}")
-[ -n "$agent" ] && F+=("agent=${agent}")
-[ -n "$sid" ]   && F+=("session=${sid}")
-[ -n "$title" ] && F+=("title=${title}")
-[ -n "$brief" ] && F+=("brief=${brief}")
-( # The whole message travels as the body of a POST. A listener older than protocol 5
-  # (or a curl without --url-query) gets its opening in the query instead.
-  proto=0
-  if [ -n "$body" ] && [ -s "$body" ] && curl --help all 2>/dev/null | grep -q -- '--url-query'; then
-    proto="$(curl -s --noproxy '*' --max-time 2 "http://localhost:${PORT}/ping" 2>/dev/null)"
-    case "$proto" in *proto=*) proto="${proto##*proto=}"; proto="${proto%%[!0-9]*}";; *) proto=0;; esac
-  fi
-  A=()
-  if [ "${proto:-0}" -ge 5 ]; then
-    for f in "${F[@]}"; do A+=(--url-query "$f"); done
-    A+=(-H "Content-Type: text/plain; charset=utf-8" --data-binary "@${body}")
-  else
-    A=(-G); for f in "${F[@]}"; do A+=(--data-urlencode "$f"); done
-    [ -n "$short" ] && [ -s "$short" ] && A+=(--data-urlencode "body@${short}")
-  fi
-  code="$(curl -s --noproxy '*' --max-time 5 "${HDR[@]}" "${A[@]}" -o /dev/null -w '%{http_code}' \
-    "http://localhost:${PORT}/${act}" 2>/dev/null)"; ec=$?
-  log "sent act=${act} http=${code} curl_exit=${ec} $info" ) >/dev/null 2>&1 &
+# The request goes out through cc_client.py: signed with the token, which never
+# travels, and only to a listener that proves it holds the token. The fields go in
+# the environment, never on a command line (other users of the host can read those).
+( res="$(CC_F_LABEL="$label" CC_F_AGENT="$agent" CC_F_SESSION="$sid" CC_F_TITLE="$title" CC_F_BRIEF="$brief" \
+      CC_F_BODY_FILE="$body" CC_NOTIFY_PORT="$PORT" CC_NOTIFIER_DIR="$DIR" "$PYBIN" "$HERE/cc_client.py" send "$act" 2>/dev/null)"
+  log "sent act=${act} ${res:-http=000 err=client_failed auth=-} $info" ) >/dev/null 2>&1 &
 exit 0
 CCN_EOF_notify_done_sh
   cat > "$DIR/notify_healthcheck.sh" <<'CCN_EOF_notify_healthcheck_sh'
 #!/bin/bash
 # SessionStart hook: warn (into the agent's context) only if something is wrong —
-# the notifier is unreachable, the Mac-side listener is older than these hooks, or
+# the notifier is unreachable, the listener cannot prove it holds this machine's
+# token (cc_client.py ping), the Mac-side listener is older than these hooks, or
 # the hook helper cannot run. Also tidies the per-session state and the hook log.
 PORT="${CC_NOTIFY_PORT:-28765}"
 DIR="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LOG="${CC_NOTIFY_LOG:-$DIR/hook.log}"
 
-resp="$(curl -s --noproxy '*' --max-time 3 -w '\n%{http_code}' "http://localhost:${PORT}/ping" 2>/dev/null)"
-code="${resp##*$'\n'}"; body="${resp%$'\n'*}"
-if [ "$code" != "200" ]; then
-  echo "NOTE: CC round-end notifier is unreachable (localhost:${PORT} -> '${code:-no-response}'). If this is a REMOTE machine, restore the tunnel from your Mac: ssh -O cancel -R ${PORT}:localhost:${PORT} <host> 2>/dev/null; ssh -O forward -R ${PORT}:localhost:${PORT} <host>. Verify: $DIR/cc_tunnel_test.sh"
-else
-  proto=1; case "$body" in *proto=*) proto="${body##*proto=}"; proto="${proto%%[!0-9]*}";; esac
-  if [ "${proto:-1}" -lt 2 ]; then
-    echo "NOTE: the cc-notifier listener on the Mac is older than the hooks on this machine (protocol ${proto:-1}, need 5). Until it is updated, alarms from different sessions still replace and cancel each other there, and neither the banner nor the phone push shows a session title or summary. Fix: re-run the cc-notifier install.sh on the Mac."
-  elif [ "$proto" -lt 3 ]; then
-    echo "NOTE: the cc-notifier listener on the Mac is behind the hooks on this machine (protocol ${proto}, need 5). Alarms work, but the phone push carries no session title, summary or message, and every alarm is titled Claude Code whichever agent sent it. Fix: re-run the cc-notifier install.sh on the Mac."
-  elif [ "$proto" -lt 4 ]; then
-    echo "NOTE: the cc-notifier listener on the Mac is behind the hooks on this machine (protocol ${proto}, need 5). Alarms work, but the phone push carries only the one-sentence summary, not the message itself. Fix: re-run the cc-notifier install.sh on the Mac."
-  elif [ "$proto" -lt 5 ]; then
-    echo "NOTE: the cc-notifier listener on the Mac is one version behind the hooks on this machine (protocol ${proto}, need 5). Alarms work, but the phone push stops at 3,500 characters of a long message. Fix: re-run the cc-notifier install.sh on the Mac."
-  fi
-fi
-
 PYBIN="$(command -v python3 || echo /usr/bin/python3)"
+res="$(CC_NOTIFY_PORT="$PORT" CC_NOTIFIER_DIR="$DIR" "$PYBIN" "$HERE/cc_client.py" ping 2>/dev/null)"
+case "$res" in
+  proto=*\ verified=yes*) ;;
+  ""|unreachable*)
+    echo "NOTE: CC round-end notifier is unreachable (nothing answers on localhost:${PORT}). If this is a REMOTE machine, restore the tunnel from your Mac: ssh -O cancel -R ${PORT}:localhost:${PORT} <host> 2>/dev/null; ssh -O forward -R ${PORT}:localhost:${PORT} <host>. Verify: $DIR/cc_tunnel_test.sh";;
+  *token=none*)
+    echo "NOTE: cc-notifier has no token on this machine ($DIR/token), so it sends nothing. On the Mac: ~/.cc-notifier/cc_token.sh push <ssh alias of this machine>.";;
+  *legacy=yes*)
+    echo "NOTE: the cc-notifier listener on the Mac is protocol 5. Notifications still work, but this machine sends it the token itself (in a header) until the Mac is updated: re-run the cc-notifier install.sh on the Mac, then on the Mac: ~/.cc-notifier/cc_token.sh rotate <ssh alias of this machine>.";;
+  *listener_auth=none*)
+    echo "NOTE: the cc-notifier listener on the Mac has no token, so it refuses every notification. On the Mac: ~/.cc-notifier/cc_token.sh new, then cc_token.sh push <ssh alias of this machine>.";;
+  proto=[0-5]\ *)
+    echo "NOTE: the cc-notifier listener on the Mac is older than the hooks on this machine (${res%% *}, need protocol 6, signed requests), so nothing is sent to it. Fix: re-run the cc-notifier install.sh on the Mac. (If the Mac is current, something else answers on localhost:${PORT} here.)";;
+  *)
+    echo "NOTE: something answers on localhost:${PORT} but cannot prove it holds this machine's cc-notifier token, so nothing is sent to it. Either the two ends have different tokens (on the Mac: ~/.cc-notifier/cc_token.sh push <ssh alias of this machine>) or someone else holds that port on this host (then restore the tunnel from the Mac). Check: $DIR/cc_tunnel_test.sh";;
+esac
+
 if [ "$("$PYBIN" "$HERE/cc_hook.py" check 2>/dev/null)" != "ok" ]; then
   echo "NOTE: cc-notifier's hook helper cannot run ($PYBIN $HERE/cc_hook.py). Round-end notifications fall back to always notifying, with no brief and no per-session cancel."
 fi
@@ -1207,10 +1573,10 @@ if [ -n "$PAYLOAD" ]; then
 fi
 case "$verdict" in
   cancel)
-    HDR=(); [ -f "$DIR/token" ] && HDR=(-H "X-CC-Token: $(cat "$DIR/token")")
-    ( code="$(curl -s --noproxy '*' --max-time 2 "${HDR[@]}" -G --data-urlencode "session=${sid}" -o /dev/null \
-        -w '%{http_code}' "http://localhost:${PORT}/stop" 2>/dev/null)"; ec=$?
-      log "cancel http=${code} curl_exit=${ec} $info" ) >/dev/null 2>&1 &
+    # Signed, like every request (cc_client.py); the session id goes in the environment.
+    ( res="$(CC_F_SESSION="$sid" CC_NOTIFY_TIMEOUT=2 CC_NOTIFY_PORT="$PORT" CC_NOTIFIER_DIR="$DIR" \
+          "$PYBIN" "$HERE/cc_client.py" send stop 2>/dev/null)"
+      log "cancel ${res:-http=000 err=client_failed auth=-} $info" ) >/dev/null 2>&1 &
     ;;
   keep) log "keep $info";;
   # No session to act for: leave every alarm alone rather than cancel someone else's.
@@ -1262,8 +1628,15 @@ if [ -n "${CC_TELEGRAM_TOKEN:-}" ] && [ -n "${CC_TELEGRAM_CHAT_ID:-}" ]; then
     [ -n "$LEAD" ] && PUSH="${LEAD}
 ${STATUS}"
   fi
-  _push(){ curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://api.telegram.org/bot${CC_TELEGRAM_TOKEN}/sendMessage" \
-      --data-urlencode "chat_id=${CC_TELEGRAM_CHAT_ID}" --data-urlencode "text=$1" 2>/dev/null; }
+  # The bot token is part of the URL, so curl reads it on stdin, never from its
+  # command line (any local user can list those); the text goes in a private file.
+  _push(){
+    case "$CC_TELEGRAM_TOKEN$CC_TELEGRAM_CHAT_ID" in *[!A-Za-z0-9:@_-]*) return 1;; esac
+    _f="$(mktemp "${TMPDIR:-/tmp}/ccpush.XXXXXX")" || return 1
+    printf '%s' "$1" > "$_f"
+    printf 'url = "https://api.telegram.org/bot%s/sendMessage"\ndata-urlencode = "chat_id=%s"\ndata-urlencode = "text@%s"\n' \
+        "$CC_TELEGRAM_TOKEN" "$CC_TELEGRAM_CHAT_ID" "$_f" | curl -s --max-time 8 -o /dev/null -w '%{http_code}' --config - 2>/dev/null
+    rm -f "$_f"; }
   _PY="$(command -v python3 || echo /usr/bin/python3)"
   # The whole message when there is one; if that does not go out, the short form does.
   ( if [ "${CC_TELEGRAM_BRIEF:-1}" = 0 ] || [ ! -s "${CC_BODY_FILE:-}" ] || \
@@ -1337,9 +1710,14 @@ session share one slot.
 
 Guards:
   - rejects requests carrying a non-local Origin header (browser CSRF / DNS-rebind);
-  - if a token file (<dir>/token) exists, action endpoints require a matching
-    X-CC-Token header (/ping stays open for liveness). The token is re-read per
-    request, so enabling/disabling auth needs no listener restart.
+  - protocol 6: the token (<dir>/token) is a key that never travels. An action
+    is carried out only when the request is signed with it (X-CC-Time, X-CC-Nonce,
+    X-CC-Sig: see cc_client.py), within WINDOW seconds of its time, and its nonce
+    has not been seen before. /ping?c=<challenge> answers with a proof that this
+    listener holds the token, so a sender can tell it from anyone else who might
+    listen on the port at its end of the tunnel. Without a token file every action
+    is refused (and /ping says auth=none). The token is re-read per request, so
+    changing it needs no restart.
 The ?agent=, ?label=, ?title= and ?brief= queries are sanitized and passed to the
 alarm as $CC_AGENT (who is notifying: Claude Code, Codex, ...), $CC_LABEL,
 $CC_TITLE and $CC_BRIEF ($CC_SESSION carries the session id). The message itself,
@@ -1348,7 +1726,7 @@ body of a POST (text/plain), or ?body= from senders that cannot post, and
 reaches the alarm in a file, $CC_BODY_FILE (too long for the environment).
 Any sender can use these; none is required.
 """
-import http.server, os, re, signal, socket, socketserver, subprocess, threading, time
+import hashlib, hmac, http.server, os, re, signal, socket, socketserver, subprocess, sys, threading, time
 from urllib.parse import urlsplit, parse_qs
 
 PORT = int(os.environ.get("CC_NOTIFY_PORT", "28765"))
@@ -1358,20 +1736,64 @@ BEEP = os.path.join(HERE, "cc_beep.sh")
 ASK = os.path.join(HERE, "cc_ask.sh")
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 BODIES = os.path.join(HERE, "tmp")      # message bodies on their way to the phone push
-PROTO = 5            # 2: per-session alarms, title + brief; 3: agent name, summary in the phone push; 4: message body in the phone push; 5: the whole message, posted. Reported by /ping.
+PROTO = 6            # 2: per-session alarms, title + brief; 3: agent name, summary in the phone push; 4: message body in the phone push; 5: the whole message, posted; 6: signed requests, the token never travels. Reported by /ping.
 MAX_POST = 1 << 20   # bytes of posted text read from one request
 MAX_BODY = 60000     # characters of it passed on (about fifteen Telegram messages)
 MAX_ALARMS = 16      # alarms alive at once; the oldest gives way beyond this
+WINDOW = 300         # seconds a signed request stays good (the two clocks may differ by this much)
+DEADLINE = 5         # seconds a connection has for its whole request; a slow one is cut off
+MAX_CONNECTIONS = 64 # connections handled at once; more are closed at once (a flood cannot pin every thread)
+HEX32 = re.compile(r"[0-9a-f]{32}\Z"); HEX64 = re.compile(r"[0-9a-f]{64}\Z"); TIME = re.compile(r"[0-9]{1,12}\Z")
 
 _lock = threading.Lock(); _alarms = {}   # session id ("" = none given) -> alarm process
+_seen = {}                               # nonce -> when it was used; a nonce is good once
 
 
 def _token():
+    """The shared token as bytes, b"" when there is none."""
     try:
-        with open(os.path.join(HERE, "token")) as f:
+        with open(os.path.join(HERE, "token"), "rb") as f:
             return f.read().strip()
     except Exception:
-        return ""
+        return b""
+
+
+# The protocol; cc_client.py holds the same functions (tests/test_security.py checks they agree).
+def request_sig(key, method, path, query, body, t, nonce):
+    msg = "cc-notifier/6 req\n%s\n%s\n%s\n%s\n%d\n%s" % (
+        method, path, query, hashlib.sha256(body).hexdigest(), t, nonce)
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def ping_proof(key, challenge):
+    return hmac.new(key, ("cc-notifier/6 pong\n" + challenge).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def check_request(key, headers, method, path, query, body, now=None):
+    """-> None when the request may be carried out, else (HTTP status, reason)."""
+    if not key:
+        return 403, "no token on the listener"
+    t, nonce, sig = (headers.get(h) or "" for h in ("X-CC-Time", "X-CC-Nonce", "X-CC-Sig"))
+    if not (TIME.match(t) and HEX32.match(nonce) and HEX64.match(sig)):
+        return 401, "not signed"
+    now = time.time() if now is None else now
+    if abs(now - int(t)) > WINDOW:
+        return 401, "too old or too new (the clocks differ by %d s?)" % (now - int(t))
+    if not hmac.compare_digest(sig.encode(), request_sig(key, method, path, query, body, int(t), nonce).encode()):
+        return 403, "bad signature"
+    with _lock:
+        if len(_seen) > 2048:
+            for n in [n for n, when in _seen.items() if now - when > 2 * WINDOW]: del _seen[n]
+        if nonce in _seen:
+            return 403, "replayed"
+        _seen[nonce] = now
+    return None
+
+
+def _note(line):
+    """One line for the launchd log: what was refused, never a secret."""
+    try: print(time.strftime("%Y-%m-%dT%H:%M:%SZ ", time.gmtime()) + line, file=sys.stderr, flush=True)
+    except Exception: pass
 
 
 def _text(s, limit):
@@ -1440,23 +1862,48 @@ def play_beep():
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    # Anyone on a shared login node can connect to the port at the far end of the
+    # tunnel. A connection that sends its request slowly, or not at all, is cut off
+    # after DEADLINE seconds in all (one request per connection: HTTP/1.0).
+    timeout = DEADLINE
+    def setup(self):
+        super().setup()
+        self._cutoff = threading.Timer(DEADLINE, self._cut); self._cutoff.daemon = True; self._cutoff.start()
+    def _cut(self):
+        try: self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError: pass
+    def handle(self):
+        try: super().handle()
+        except OSError: pass                      # cut off, or the sender went away: nothing to answer
+    def finish(self):
+        self._cutoff.cancel()
+        try: super().finish()
+        except OSError: pass
     def _route(self):
         origin = self.headers.get("Origin")
         if origin and urlsplit(origin).hostname not in LOCAL_HOSTS:
             self.send_response(403); self.end_headers(); return
         u = urlsplit(self.path)
         path = u.path.rstrip("/")
-        tok = _token()
-        if path != "/ping" and tok and self.headers.get("X-CC-Token", "") != tok:
-            self.send_response(403); self.end_headers(); return
+        key = _token()
         q = parse_qs(u.query)
         arg = lambda name: q.get(name, [""])[0]
-        posted = ""
+        if path in ("/ping", ""):
+            words = ["ok", "proto=%d" % PROTO]
+            if not key: words.append("auth=none")
+            elif HEX32.match(arg("c")): words.append("proof=" + ping_proof(key, arg("c")))
+            return self._answer(200, " ".join(words))
+        raw = b""
         if self.command == "POST":
             try: size = int(self.headers.get("Content-Length") or 0)
             except ValueError: size = 0
             if size > MAX_POST: self.send_response(413); self.end_headers(); return
-            if size > 0: posted = self.rfile.read(size).decode("utf-8", "replace")
+            if size > 0: raw = self.rfile.read(size)
+        refused = check_request(key, self.headers, self.command, u.path, u.query, raw)
+        if refused:
+            _note("refused %s %s: %s" % (self.command, path, refused[1]))
+            return self._answer(refused[0], "refused: " + refused[1])
+        posted = raw.decode("utf-8", "replace")
         session = re.sub(r"[^A-Za-z0-9_-]", "", arg("session"))[:64]
         fields = dict(CC_LABEL=re.sub(r"[^\w\-./ ]", "", arg("label"))[:64], CC_SESSION=session,
                       CC_AGENT=_text(arg("agent"), 32), CC_TITLE=_text(arg("title"), 80),
@@ -1468,18 +1915,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif path == "/ask": start_proc(ASK, session, **fields); body = b"ask\n"
             elif path == "/beep": play_beep(); body = b"beep\n"
             elif path == "/stop": stop_alarm(session if "session" in q else None); body = b"stopped\n"
-            elif path in ("/ping", ""): body = b"ok proto=%d\n" % PROTO
             else: self.send_response(404); self.end_headers(); return
         except OSError:                           # the alarm could not be started: say so, do not look delivered
             self.send_response(500); self.end_headers(); return
         self.send_response(200); self.send_header("Content-Length", str(len(body)))
         self.end_headers(); self.wfile.write(body)
+    def _answer(self, code, text):
+        data = (text + "\n").encode("utf-8")
+        self.send_response(code); self.send_header("Content-Length", str(len(data)))
+        self.end_headers(); self.wfile.write(data)
     do_GET = _route; do_POST = _route
     def log_message(self, *a): pass
 
 
-class V4(socketserver.ThreadingTCPServer): allow_reuse_address = True; daemon_threads = True
-class V6(socketserver.ThreadingTCPServer): address_family = socket.AF_INET6; allow_reuse_address = True; daemon_threads = True
+_slots = threading.BoundedSemaphore(MAX_CONNECTIONS); _busy = {"dropped": 0, "noted": 0.0}
+
+
+class Capped(socketserver.ThreadingTCPServer):
+    """At most MAX_CONNECTIONS handled at once (both loopback families together)."""
+    allow_reuse_address = True; daemon_threads = True
+    def process_request(self, request, client_address):
+        if not _slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            _busy["dropped"] += 1
+            if time.time() - _busy["noted"] > 60:
+                _note("busy: %d connections closed unanswered (more than %d at once)" % (_busy["dropped"], MAX_CONNECTIONS))
+                _busy["noted"] = time.time()
+            return
+        try: super().process_request(request, client_address)
+        except Exception: _slots.release(); raise
+    def process_request_thread(self, request, client_address):
+        try: super().process_request_thread(request, client_address)
+        finally: _slots.release()
+
+
+class V4(Capped): pass
+class V6(Capped): address_family = socket.AF_INET6
 
 
 def main():
@@ -1700,10 +2171,11 @@ CCN_EOF_cc_preview_sounds_sh
   cat > "$DIR/cc_stop.sh" <<'CCN_EOF_cc_stop_sh'
 #!/bin/bash
 # Instant local stop — bind to a hotkey (Karabiner / Shortcuts: Run Shell Script).
-PORT="${CC_NOTIFY_PORT:-28765}"
+# Silences every alarm. Signed with the token like every request (cc_client.py,
+# installed next to this script); the token is never on a command line.
 DIR="$(cd "$(dirname "$0")" && pwd)"
-HDR=(); [ -f "$DIR/token" ] && HDR=(-H "X-CC-Token: $(cat "$DIR/token")")
-curl -s --noproxy '*' --max-time 2 "${HDR[@]}" "http://localhost:${PORT}/stop" >/dev/null 2>&1
+PYBIN="$(command -v python3 || echo /usr/bin/python3)"
+CC_NOTIFIER_DIR="$DIR" CC_NOTIFY_TIMEOUT=2 "$PYBIN" "$DIR/cc_client.py" send stop >/dev/null 2>&1
 CCN_EOF_cc_stop_sh
   cat > "$DIR/cc_telegram.py" <<'CCN_EOF_cc_telegram_py'
 #!/usr/bin/env python3
@@ -1722,12 +2194,15 @@ messages, in order. To keep the chat short, a long body shows its opening and
 folds the rest into an expandable quote: tap it to read on. Nothing is hosted
 anywhere; the text lives in the chat and nowhere else.
 
-The HTTPS call is curl's, as everywhere else in this kit. Exit status 0 when the
-first message was accepted; the caller sends its short form otherwise.
+The HTTPS call is curl's, as everywhere else in this kit. The bot token is part of
+the URL, so curl reads the URL from its standard input (a config), never from its
+command line, which any local user can list. Exit status 0 when the first message
+was accepted; the caller sends its short form otherwise.
 """
 import html
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1800,17 +2275,26 @@ def render(part, as_html):
     return text
 
 
+def curl_config(options):
+    """[(option, value)] -> a curl config file (curl --config -), values quoted."""
+    q = lambda v: '"%s"' % v.replace("\\", "\\\\").replace('"', '\\"')
+    return "".join("%s = %s\n" % (name, q(value)) for name, value in options).encode("utf-8")
+
+
 def send(token, chat, text, as_html):
     """-> Telegram's answer as a dict ({} when there was none)."""
+    if not (re.match(r"[0-9A-Za-z:_-]+\Z", token) and re.match(r"[0-9A-Za-z@_-]+\Z", chat)):
+        return {"description": "CC_TELEGRAM_TOKEN or CC_TELEGRAM_CHAT_ID has an unexpected character"}
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as f:
         f.write(text)
-    args = ["curl", "-s", "--max-time", "15", "https://api.telegram.org/bot%s/sendMessage" % token,
-            "--data-urlencode", "chat_id=" + chat, "--data-urlencode", "text@" + f.name,
-            "--data-urlencode", "disable_web_page_preview=true"]
+    options = [("url", "https://api.telegram.org/bot%s/sendMessage" % token),
+               ("data-urlencode", "chat_id=" + chat), ("data-urlencode", "text@" + f.name),
+               ("data-urlencode", "disable_web_page_preview=true")]
     if as_html:
-        args += ["--data-urlencode", "parse_mode=HTML"]
+        options.append(("data-urlencode", "parse_mode=HTML"))
     try:
-        p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        p = subprocess.run(["curl", "-s", "--max-time", "15", "--config", "-"], input=curl_config(options),
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         return json.loads(p.stdout.decode("utf-8", "replace"))
     except Exception:
         return {}
@@ -1899,12 +2383,22 @@ HOST="${CC_TUNNEL_HOST:-}"
 [ -n "$HOST" ] || exit 0                            # not configured -> off
 ssh -O check "$HOST" >/dev/null 2>&1 || exit 0      # no live master -> nothing to inject into
 
-# Already healthy? Test the real remote->Mac path over the master (no new connection).
-ssh "$HOST" "curl -s --noproxy '*' -o /dev/null --max-time 2 http://localhost:${PORT}/ping" >/dev/null 2>&1 && exit 0
+# Already healthy? Ask the far end of the tunnel, over the master (no new
+# connection), for a proof that only this Mac's listener can give: it holds the
+# token. Any other answer - nothing, or someone else listening on that port on a
+# shared login node - means the forward has to be put back.
+PYBIN="$(command -v python3 || echo /usr/bin/python3)"
+c="$(CC_NOTIFIER_DIR="$DIR" "$PYBIN" "$DIR/cc_client.py" challenge 2>/dev/null)"
+if [ -n "$c" ] && ssh "$HOST" "curl -s --noproxy '*' --max-time 2 'http://localhost:${PORT}/ping?c=${c}'" 2>/dev/null \
+     | CC_NOTIFIER_DIR="$DIR" "$PYBIN" "$DIR/cc_client.py" verify "$c" >/dev/null 2>&1; then
+  exit 0
+fi
 
-# Broken (forward missing or stale) -> refresh it on the live master.
+# Broken (forward missing or stale, or the port taken) -> refresh it on the live master.
 ssh -O cancel  -R "${PORT}:localhost:${PORT}" "$HOST" >/dev/null 2>&1
-ssh -O forward -R "${PORT}:localhost:${PORT}" "$HOST" >/dev/null 2>&1
+if ! err="$(ssh -O forward -R "${PORT}:localhost:${PORT}" "$HOST" 2>&1)"; then
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) could not forward port ${PORT} on ${HOST}: ${err} (if the port is taken there, someone else holds it: nothing is sent to it)"
+fi
 CCN_EOF_cc_tunnel_keep_sh
   cat > "$DIR/karabiner-stop.json" <<'CCN_EOF_karabiner_stop_json'
 {
@@ -2104,6 +2598,10 @@ if [ "$ROLE" = receiver ]; then
   write_sender
   write_config
   apply_port
+  secure_files
+  if [ ! -s "$DIR/token" ]; then
+    "$DIR/cc_token.sh" new 2>/dev/null && log "made a token ($DIR/token): every request is signed with it; the listener refuses anything else"
+  fi
   merge_hooks
   codex_hooks
   if [ "$OS" = Darwin ]; then
@@ -2151,11 +2649,28 @@ if [ "$ROLE" = receiver ]; then
   Test now:  $DIR/cc_tunnel_test.sh beep   (and: $DIR/cc_tunnel_test.sh ask)
   Arm/disarm any session:  $DIR/cc_notify_arm.sh on | off | status
   Diagnose anytime:  $DIR/cc_doctor.sh
-  Secure it (recommended for shared remotes):  $DIR/cc_token.sh new   (copy the value to each remote)
+  Each REMOTE needs this Mac's token (it moves over ssh, never on a command line):
+       $DIR/cc_token.sh push <ssh alias of the remote>
 EOF_NEXT
+  if [ "$FROM_OLD" = 1 ]; then
+    hdr "now: a new token"
+    cat <<EOF_ROTATE
+  The kit you had sent the token itself with every request, so it may have been
+  seen. Once each remote runs the new sender too (it refuses to hand a token to a
+  listener that cannot prove itself), replace the token everywhere at once:
+       $DIR/cc_token.sh rotate <ssh alias of each remote>...
+EOF_ROTATE
+  fi
 else
   write_sender
   apply_port
+  if [ "$FROM_OLD" = 1 ]; then
+    # Until the Mac runs protocol 6, keep serving its listener the way it expects,
+    # but only with THIS token, which it had already. A new token never travels.
+    python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read().strip()).hexdigest())' \
+      "$DIR/token" > "$DIR/legacy-token.sha256"
+  fi
+  secure_files
   merge_hooks
   codex_hooks
   hdr "remote sender installed"
@@ -2168,9 +2683,14 @@ else
          RemoteForward $PORT localhost:$PORT
     2. Reconnect (or: ssh -O forward -R $PORT:localhost:$PORT <host>)
     3. Make sure the Mac receiver is installed (run this script on the Mac).
+    4. Give this machine the Mac's token (over ssh, never on a command line):
+         ~/.cc-notifier/cc_token.sh push <ssh alias of this machine>
   Verify from here:  $DIR/cc_tunnel_test.sh   (or full check: $DIR/cc_doctor.sh)
   Arm/disarm any session:  $DIR/cc_notify_arm.sh on | off | status
-  If your Mac set an auth token:  $DIR/cc_token.sh set <value-from-the-Mac>
 EOF_NEXT
+  if [ ! -s "$DIR/token" ]; then log "NOTE: no token here yet, so nothing is sent: step 4."; fi
+  if [ "$FROM_OLD" = 1 ]; then
+    log "NOTE: until the Mac is updated too, its listener (protocol 5) still gets this machine's current token in a header. Then on the Mac: ~/.cc-notifier/cc_token.sh rotate <this machine>"
+  fi
 fi
 hdr "done"

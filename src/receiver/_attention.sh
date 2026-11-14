@@ -37,8 +37,15 @@ if [ -n "${CC_TELEGRAM_TOKEN:-}" ] && [ -n "${CC_TELEGRAM_CHAT_ID:-}" ]; then
     [ -n "$LEAD" ] && PUSH="${LEAD}
 ${STATUS}"
   fi
-  _push(){ curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://api.telegram.org/bot${CC_TELEGRAM_TOKEN}/sendMessage" \
-      --data-urlencode "chat_id=${CC_TELEGRAM_CHAT_ID}" --data-urlencode "text=$1" 2>/dev/null; }
+  # The bot token is part of the URL, so curl reads it on stdin, never from its
+  # command line (any local user can list those); the text goes in a private file.
+  _push(){
+    case "$CC_TELEGRAM_TOKEN$CC_TELEGRAM_CHAT_ID" in *[!A-Za-z0-9:@_-]*) return 1;; esac
+    _f="$(mktemp "${TMPDIR:-/tmp}/ccpush.XXXXXX")" || return 1
+    printf '%s' "$1" > "$_f"
+    printf 'url = "https://api.telegram.org/bot%s/sendMessage"\ndata-urlencode = "chat_id=%s"\ndata-urlencode = "text@%s"\n' \
+        "$CC_TELEGRAM_TOKEN" "$CC_TELEGRAM_CHAT_ID" "$_f" | curl -s --max-time 8 -o /dev/null -w '%{http_code}' --config - 2>/dev/null
+    rm -f "$_f"; }
   _PY="$(command -v python3 || echo /usr/bin/python3)"
   # The whole message when there is one; if that does not go out, the short form does.
   ( if [ "${CC_TELEGRAM_BRIEF:-1}" = 0 ] || [ ! -s "${CC_BODY_FILE:-}" ] || \

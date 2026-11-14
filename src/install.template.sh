@@ -15,6 +15,7 @@
 #                   and on questions (AskUserQuestion). Codex uses the same hook
 #                   scripts once switched on (--codex, or cc_codex_hooks.sh on).
 set -euo pipefail
+umask 077          # the kit holds the token, the config (Telegram bot token) and message texts
 
 PORT=28765
 DIR="${CC_NOTIFIER_DIR:-$HOME/.cc-notifier}"
@@ -42,6 +43,19 @@ esac
 
 log(){ printf '  %s\n' "$*"; }
 hdr(){ printf '\n== %s ==\n' "$*"; }
+
+# An earlier kit (protocol 5 or older) sent the token itself. Seen before the new
+# files are written: a token, but no cc_client.py yet.
+FROM_OLD=0
+[ -s "$DIR/token" ] && [ ! -f "$DIR/cc_client.py" ] && FROM_OLD=1
+
+secure_files(){
+  chmod 700 "$DIR"
+  local f
+  for f in token config legacy-token.sha256; do [ -f "$DIR/$f" ] && chmod 600 "$DIR/$f"; done
+  for f in sessions tmp; do [ -d "$DIR/$f" ] && chmod 700 "$DIR/$f"; done
+  return 0
+}
 
 # __GENERATED_WRITERS__
 
@@ -218,6 +232,10 @@ if [ "$ROLE" = receiver ]; then
   write_sender
   write_config
   apply_port
+  secure_files
+  if [ ! -s "$DIR/token" ]; then
+    "$DIR/cc_token.sh" new 2>/dev/null && log "made a token ($DIR/token): every request is signed with it; the listener refuses anything else"
+  fi
   merge_hooks
   codex_hooks
   if [ "$OS" = Darwin ]; then
@@ -265,11 +283,28 @@ if [ "$ROLE" = receiver ]; then
   Test now:  $DIR/cc_tunnel_test.sh beep   (and: $DIR/cc_tunnel_test.sh ask)
   Arm/disarm any session:  $DIR/cc_notify_arm.sh on | off | status
   Diagnose anytime:  $DIR/cc_doctor.sh
-  Secure it (recommended for shared remotes):  $DIR/cc_token.sh new   (copy the value to each remote)
+  Each REMOTE needs this Mac's token (it moves over ssh, never on a command line):
+       $DIR/cc_token.sh push <ssh alias of the remote>
 EOF_NEXT
+  if [ "$FROM_OLD" = 1 ]; then
+    hdr "now: a new token"
+    cat <<EOF_ROTATE
+  The kit you had sent the token itself with every request, so it may have been
+  seen. Once each remote runs the new sender too (it refuses to hand a token to a
+  listener that cannot prove itself), replace the token everywhere at once:
+       $DIR/cc_token.sh rotate <ssh alias of each remote>...
+EOF_ROTATE
+  fi
 else
   write_sender
   apply_port
+  if [ "$FROM_OLD" = 1 ]; then
+    # Until the Mac runs protocol 6, keep serving its listener the way it expects,
+    # but only with THIS token, which it had already. A new token never travels.
+    python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read().strip()).hexdigest())' \
+      "$DIR/token" > "$DIR/legacy-token.sha256"
+  fi
+  secure_files
   merge_hooks
   codex_hooks
   hdr "remote sender installed"
@@ -282,9 +317,14 @@ else
          RemoteForward $PORT localhost:$PORT
     2. Reconnect (or: ssh -O forward -R $PORT:localhost:$PORT <host>)
     3. Make sure the Mac receiver is installed (run this script on the Mac).
+    4. Give this machine the Mac's token (over ssh, never on a command line):
+         ~/.cc-notifier/cc_token.sh push <ssh alias of this machine>
   Verify from here:  $DIR/cc_tunnel_test.sh   (or full check: $DIR/cc_doctor.sh)
   Arm/disarm any session:  $DIR/cc_notify_arm.sh on | off | status
-  If your Mac set an auth token:  $DIR/cc_token.sh set <value-from-the-Mac>
 EOF_NEXT
+  if [ ! -s "$DIR/token" ]; then log "NOTE: no token here yet, so nothing is sent: step 4."; fi
+  if [ "$FROM_OLD" = 1 ]; then
+    log "NOTE: until the Mac is updated too, its listener (protocol 5) still gets this machine's current token in a header. Then on the Mac: ~/.cc-notifier/cc_token.sh rotate <this machine>"
+  fi
 fi
 hdr "done"

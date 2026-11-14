@@ -9,9 +9,14 @@ session share one slot.
 
 Guards:
   - rejects requests carrying a non-local Origin header (browser CSRF / DNS-rebind);
-  - if a token file (<dir>/token) exists, action endpoints require a matching
-    X-CC-Token header (/ping stays open for liveness). The token is re-read per
-    request, so enabling/disabling auth needs no listener restart.
+  - protocol 6: the token (<dir>/token) is a key that never travels. An action
+    is carried out only when the request is signed with it (X-CC-Time, X-CC-Nonce,
+    X-CC-Sig: see cc_client.py), within WINDOW seconds of its time, and its nonce
+    has not been seen before. /ping?c=<challenge> answers with a proof that this
+    listener holds the token, so a sender can tell it from anyone else who might
+    listen on the port at its end of the tunnel. Without a token file every action
+    is refused (and /ping says auth=none). The token is re-read per request, so
+    changing it needs no restart.
 The ?agent=, ?label=, ?title= and ?brief= queries are sanitized and passed to the
 alarm as $CC_AGENT (who is notifying: Claude Code, Codex, ...), $CC_LABEL,
 $CC_TITLE and $CC_BRIEF ($CC_SESSION carries the session id). The message itself,
@@ -20,7 +25,7 @@ body of a POST (text/plain), or ?body= from senders that cannot post, and
 reaches the alarm in a file, $CC_BODY_FILE (too long for the environment).
 Any sender can use these; none is required.
 """
-import http.server, os, re, signal, socket, socketserver, subprocess, threading, time
+import hashlib, hmac, http.server, os, re, signal, socket, socketserver, subprocess, sys, threading, time
 from urllib.parse import urlsplit, parse_qs
 
 PORT = int(os.environ.get("CC_NOTIFY_PORT", "28765"))
@@ -30,20 +35,64 @@ BEEP = os.path.join(HERE, "cc_beep.sh")
 ASK = os.path.join(HERE, "cc_ask.sh")
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 BODIES = os.path.join(HERE, "tmp")      # message bodies on their way to the phone push
-PROTO = 5            # 2: per-session alarms, title + brief; 3: agent name, summary in the phone push; 4: message body in the phone push; 5: the whole message, posted. Reported by /ping.
+PROTO = 6            # 2: per-session alarms, title + brief; 3: agent name, summary in the phone push; 4: message body in the phone push; 5: the whole message, posted; 6: signed requests, the token never travels. Reported by /ping.
 MAX_POST = 1 << 20   # bytes of posted text read from one request
 MAX_BODY = 60000     # characters of it passed on (about fifteen Telegram messages)
 MAX_ALARMS = 16      # alarms alive at once; the oldest gives way beyond this
+WINDOW = 300         # seconds a signed request stays good (the two clocks may differ by this much)
+DEADLINE = 5         # seconds a connection has for its whole request; a slow one is cut off
+MAX_CONNECTIONS = 64 # connections handled at once; more are closed at once (a flood cannot pin every thread)
+HEX32 = re.compile(r"[0-9a-f]{32}\Z"); HEX64 = re.compile(r"[0-9a-f]{64}\Z"); TIME = re.compile(r"[0-9]{1,12}\Z")
 
 _lock = threading.Lock(); _alarms = {}   # session id ("" = none given) -> alarm process
+_seen = {}                               # nonce -> when it was used; a nonce is good once
 
 
 def _token():
+    """The shared token as bytes, b"" when there is none."""
     try:
-        with open(os.path.join(HERE, "token")) as f:
+        with open(os.path.join(HERE, "token"), "rb") as f:
             return f.read().strip()
     except Exception:
-        return ""
+        return b""
+
+
+# The protocol; cc_client.py holds the same functions (tests/test_security.py checks they agree).
+def request_sig(key, method, path, query, body, t, nonce):
+    msg = "cc-notifier/6 req\n%s\n%s\n%s\n%s\n%d\n%s" % (
+        method, path, query, hashlib.sha256(body).hexdigest(), t, nonce)
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def ping_proof(key, challenge):
+    return hmac.new(key, ("cc-notifier/6 pong\n" + challenge).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def check_request(key, headers, method, path, query, body, now=None):
+    """-> None when the request may be carried out, else (HTTP status, reason)."""
+    if not key:
+        return 403, "no token on the listener"
+    t, nonce, sig = (headers.get(h) or "" for h in ("X-CC-Time", "X-CC-Nonce", "X-CC-Sig"))
+    if not (TIME.match(t) and HEX32.match(nonce) and HEX64.match(sig)):
+        return 401, "not signed"
+    now = time.time() if now is None else now
+    if abs(now - int(t)) > WINDOW:
+        return 401, "too old or too new (the clocks differ by %d s?)" % (now - int(t))
+    if not hmac.compare_digest(sig.encode(), request_sig(key, method, path, query, body, int(t), nonce).encode()):
+        return 403, "bad signature"
+    with _lock:
+        if len(_seen) > 2048:
+            for n in [n for n, when in _seen.items() if now - when > 2 * WINDOW]: del _seen[n]
+        if nonce in _seen:
+            return 403, "replayed"
+        _seen[nonce] = now
+    return None
+
+
+def _note(line):
+    """One line for the launchd log: what was refused, never a secret."""
+    try: print(time.strftime("%Y-%m-%dT%H:%M:%SZ ", time.gmtime()) + line, file=sys.stderr, flush=True)
+    except Exception: pass
 
 
 def _text(s, limit):
@@ -112,23 +161,48 @@ def play_beep():
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    # Anyone on a shared login node can connect to the port at the far end of the
+    # tunnel. A connection that sends its request slowly, or not at all, is cut off
+    # after DEADLINE seconds in all (one request per connection: HTTP/1.0).
+    timeout = DEADLINE
+    def setup(self):
+        super().setup()
+        self._cutoff = threading.Timer(DEADLINE, self._cut); self._cutoff.daemon = True; self._cutoff.start()
+    def _cut(self):
+        try: self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError: pass
+    def handle(self):
+        try: super().handle()
+        except OSError: pass                      # cut off, or the sender went away: nothing to answer
+    def finish(self):
+        self._cutoff.cancel()
+        try: super().finish()
+        except OSError: pass
     def _route(self):
         origin = self.headers.get("Origin")
         if origin and urlsplit(origin).hostname not in LOCAL_HOSTS:
             self.send_response(403); self.end_headers(); return
         u = urlsplit(self.path)
         path = u.path.rstrip("/")
-        tok = _token()
-        if path != "/ping" and tok and self.headers.get("X-CC-Token", "") != tok:
-            self.send_response(403); self.end_headers(); return
+        key = _token()
         q = parse_qs(u.query)
         arg = lambda name: q.get(name, [""])[0]
-        posted = ""
+        if path in ("/ping", ""):
+            words = ["ok", "proto=%d" % PROTO]
+            if not key: words.append("auth=none")
+            elif HEX32.match(arg("c")): words.append("proof=" + ping_proof(key, arg("c")))
+            return self._answer(200, " ".join(words))
+        raw = b""
         if self.command == "POST":
             try: size = int(self.headers.get("Content-Length") or 0)
             except ValueError: size = 0
             if size > MAX_POST: self.send_response(413); self.end_headers(); return
-            if size > 0: posted = self.rfile.read(size).decode("utf-8", "replace")
+            if size > 0: raw = self.rfile.read(size)
+        refused = check_request(key, self.headers, self.command, u.path, u.query, raw)
+        if refused:
+            _note("refused %s %s: %s" % (self.command, path, refused[1]))
+            return self._answer(refused[0], "refused: " + refused[1])
+        posted = raw.decode("utf-8", "replace")
         session = re.sub(r"[^A-Za-z0-9_-]", "", arg("session"))[:64]
         fields = dict(CC_LABEL=re.sub(r"[^\w\-./ ]", "", arg("label"))[:64], CC_SESSION=session,
                       CC_AGENT=_text(arg("agent"), 32), CC_TITLE=_text(arg("title"), 80),
@@ -140,18 +214,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif path == "/ask": start_proc(ASK, session, **fields); body = b"ask\n"
             elif path == "/beep": play_beep(); body = b"beep\n"
             elif path == "/stop": stop_alarm(session if "session" in q else None); body = b"stopped\n"
-            elif path in ("/ping", ""): body = b"ok proto=%d\n" % PROTO
             else: self.send_response(404); self.end_headers(); return
         except OSError:                           # the alarm could not be started: say so, do not look delivered
             self.send_response(500); self.end_headers(); return
         self.send_response(200); self.send_header("Content-Length", str(len(body)))
         self.end_headers(); self.wfile.write(body)
+    def _answer(self, code, text):
+        data = (text + "\n").encode("utf-8")
+        self.send_response(code); self.send_header("Content-Length", str(len(data)))
+        self.end_headers(); self.wfile.write(data)
     do_GET = _route; do_POST = _route
     def log_message(self, *a): pass
 
 
-class V4(socketserver.ThreadingTCPServer): allow_reuse_address = True; daemon_threads = True
-class V6(socketserver.ThreadingTCPServer): address_family = socket.AF_INET6; allow_reuse_address = True; daemon_threads = True
+_slots = threading.BoundedSemaphore(MAX_CONNECTIONS); _busy = {"dropped": 0, "noted": 0.0}
+
+
+class Capped(socketserver.ThreadingTCPServer):
+    """At most MAX_CONNECTIONS handled at once (both loopback families together)."""
+    allow_reuse_address = True; daemon_threads = True
+    def process_request(self, request, client_address):
+        if not _slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            _busy["dropped"] += 1
+            if time.time() - _busy["noted"] > 60:
+                _note("busy: %d connections closed unanswered (more than %d at once)" % (_busy["dropped"], MAX_CONNECTIONS))
+                _busy["noted"] = time.time()
+            return
+        try: super().process_request(request, client_address)
+        except Exception: _slots.release(); raise
+    def process_request_thread(self, request, client_address):
+        try: super().process_request_thread(request, client_address)
+        finally: _slots.release()
+
+
+class V4(Capped): pass
+class V6(Capped): address_family = socket.AF_INET6
 
 
 def main():
