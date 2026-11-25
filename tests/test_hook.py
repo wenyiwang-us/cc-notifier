@@ -314,6 +314,29 @@ def test_codex_payloads_use_the_same_path():
         assert run("done", dict(stop, stop_hook_active=True), d, "alarm", "codex")[0] == "silent"
 
 
+def test_user_session_name_beats_generated_title():
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "sessions"))
+        tr = os.path.join(d, "t.jsonl")
+        with open(tr, "w") as f:
+            f.write(json.dumps({"type": "ai-title", "aiTitle": "Generated title"}) + "\n")
+        _dump({"sessionId": "s-user", "nameSource": "user", "name": "[Nov-25] My name"}, os.path.join(d, "sessions", "1.json"))
+        _dump({"sessionId": "s-derived", "nameSource": "derived", "name": "project-79"}, os.path.join(d, "sessions", "2.json"))
+        with open(os.path.join(d, "sessions", "3.json"), "w") as f:
+            f.write("{not json")
+        old = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = d
+        try:
+            assert h.session_title({"transcript_path": tr}, {}, "s-user") == "[Nov-25] My name"
+            assert h.session_title({"transcript_path": tr}, {}, "s-derived") == "Generated title"
+            assert h.session_title({"transcript_path": tr}, {}, "s-unknown") == "Generated title"
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_CONFIG_DIR")
+            else:
+                os.environ["CLAUDE_CONFIG_DIR"] = old
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     for name, fn in tests:

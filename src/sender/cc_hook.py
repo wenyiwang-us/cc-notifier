@@ -30,6 +30,7 @@ The message itself, for the phone push, has line breaks, so it goes into files:
 <dir>/sessions/<session_id>.body (whole) and .short (its first 3,400 characters,
 for a listener that cannot take the whole). Their paths are the last two fields.
 """
+import glob
 import json
 import os
 import re
@@ -316,10 +317,28 @@ def codex_thread_name(sid):
     return ""
 
 
+def user_session_name(sid):
+    """The name the user gave this session in Claude Code, from its live record
+    ($CLAUDE_CONFIG_DIR or ~/.claude)/sessions/<pid>.json; "" when none. A rename lives
+    only there: the transcript keeps the generated title."""
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    best = (0, "")
+    for p in glob.glob(os.path.join(base, "sessions", "*.json")):
+        try:
+            with open(p, encoding="utf-8") as f:
+                e = json.load(f)
+            if isinstance(e, dict) and e.get("sessionId") == sid and e.get("nameSource") == "user" and e.get("name"):
+                best = max(best, (os.path.getmtime(p), one_line(e["name"])))
+        except Exception:
+            continue
+    return best[1]
+
+
 def session_title(d, st, sid):
-    """Session title as the agent records it now (Claude Code: transcript; Codex:
-    thread index), else the one last seen in a prompt payload."""
-    title = transcript_title(d.get("transcript_path") or "") or (codex_thread_name(sid) if sid else "")
+    """Session title as the user sees it: their own name for the session, else the one the
+    agent records (Claude Code: transcript; Codex: thread index), else the last one seen."""
+    title = (user_session_name(sid) if sid else "") or transcript_title(d.get("transcript_path") or "") \
+        or (codex_thread_name(sid) if sid else "")
     if title:
         st["title"] = title
     return shorten(title or st.get("title") or "", TITLE_CHARS)
